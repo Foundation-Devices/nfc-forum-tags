@@ -69,7 +69,7 @@ impl LockControlValue {
 
     /// Number of lock bytes (ceiling of size_in_bits / 8).
     pub fn lock_byte_count(&self) -> u16 {
-        (self.size_in_bits + 7) / 8
+        self.size_in_bits.div_ceil(8)
     }
 
     /// Number of data bytes each lock bit protects.

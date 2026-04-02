@@ -7,7 +7,11 @@
 }:
 
 {
-  packages = [ pkgs.git ];
+  packages = [
+    pkgs.git
+    pkgs.cargo-msrv
+    pkgs.cargo-sort
+  ];
 
   languages.rust.enable = true;
 

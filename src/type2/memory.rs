@@ -52,7 +52,7 @@ pub struct LockArea {
 impl LockArea {
     /// Number of lock bytes (ceiling of bits / 8).
     pub fn lock_byte_count(&self) -> u16 {
-        (self.size_in_bits + 7) / 8
+        self.size_in_bits.div_ceil(8)
     }
 
     /// Byte address past the last lock byte.
@@ -185,7 +185,7 @@ impl MemoryLayout {
                 .iter()
                 .map(|a| a.size as u32)
                 .sum::<u32>();
-        let sectors = (total_bytes + SECTOR_SIZE as u32 - 1) / SECTOR_SIZE as u32;
+        let sectors = total_bytes.div_ceil(SECTOR_SIZE as u32);
         sectors.min(255) as u8
     }
 
@@ -207,7 +207,7 @@ impl MemoryLayout {
 /// Default dynamic lock area when no Lock Control TLV is present (Section 2.2.2).
 fn default_dynamic_lock_area(data_area_size: u16) -> LockArea {
     let extra_bytes = data_area_size.saturating_sub(STATIC_DATA_AREA_SIZE as u16);
-    let lock_bits = (extra_bytes + 7) / 8;
+    let lock_bits = extra_bytes.div_ceil(8);
     // Default position: first byte after the data area.
     let byte_address = DATA_START_BLOCK as u16 * BLOCK_SIZE as u16 + data_area_size;
 

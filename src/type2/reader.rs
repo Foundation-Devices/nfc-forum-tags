@@ -172,15 +172,13 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
             };
 
             // Process each byte in this block.
-            for i in 0..BLOCK_SIZE {
+            for (i, &byte) in block_data.iter().enumerate().take(BLOCK_SIZE) {
                 let addr = byte_addr + i as u16;
                 if layout.is_skip_area(addr) {
                     continue;
                 }
                 if bytes_read < total_bytes {
-                    result
-                        .try_push(block_data[i])
-                        .map_err(|e| Type2Error::from(e))?;
+                    result.try_push(byte).map_err(Type2Error::from)?;
                     bytes_read += 1;
                 }
             }
