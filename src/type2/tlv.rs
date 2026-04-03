@@ -193,7 +193,7 @@ fn encode_tlv_length(len: u16, out: &mut DataVec) -> Result<(), Type2Error> {
 ///
 /// Parsing stops at a Terminator TLV or end of data.
 #[cfg(not(feature = "alloc"))]
-pub fn parse_tlvs(data: &[u8]) -> Result<heapless::Vec<Tlv, 16>, Type2Error> {
+pub fn parse_tlvs(data: &[u8]) -> Result<heapless::Vec<Tlv, 4>, Type2Error> {
     let mut result = heapless::Vec::new();
     parse_tlvs_into(data, &mut result)?;
     Ok(result)
@@ -295,7 +295,7 @@ trait TlvCollector {
 }
 
 #[cfg(not(feature = "alloc"))]
-impl TlvCollector for heapless::Vec<Tlv, 16> {
+impl TlvCollector for heapless::Vec<Tlv, 4> {
     fn push_tlv(&mut self, tlv: Tlv) -> Result<(), Type2Error> {
         self.push(tlv).map_err(|_| Type2Error::BufferFull)
     }
