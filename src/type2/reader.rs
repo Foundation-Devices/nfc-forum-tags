@@ -28,16 +28,22 @@ impl<E> From<Type2Error> for ReaderError<E> {
     }
 }
 
+/// Default number of retries on transient transceiver errors.
+const DEFAULT_MAX_RETRIES: u8 = 1;
+
 /// High-level NFC Forum Type 2 Tag reader/writer.
 ///
 /// Wraps a [`T2TTransceiver`] and tracks the currently selected sector.
 /// Maintains a 16-byte read cache to avoid redundant RF transactions.
+/// Retries transient transceiver errors up to `max_retries` times.
 pub struct T2TReader<'t, T: T2TTransceiver> {
     transceiver: &'t mut T,
     current_sector: u8,
     /// Cached 16-byte READ result: (block_no, data).
     cache_block: Option<u8>,
     cache_data: [u8; 16],
+    /// Maximum number of retries on transient transceiver errors.
+    max_retries: u8,
 }
 
 impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
@@ -48,7 +54,17 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
             current_sector: 0,
             cache_block: None,
             cache_data: [0u8; 16],
+            max_retries: DEFAULT_MAX_RETRIES,
         }
+    }
+
+    /// Set the maximum number of retries on transient transceiver errors.
+    ///
+    /// Default is 1 (one retry after the initial attempt). Set to 0 to
+    /// disable retries. Only transceiver-level errors are retried; NACK
+    /// responses from the tag are not retried.
+    pub fn set_max_retries(&mut self, n: u8) {
+        self.max_retries = n;
     }
 
     /// Invalidate the read cache.
@@ -56,10 +72,26 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
         self.cache_block = None;
     }
 
+    /// Transceive with retry on transceiver errors.
+    fn transceive_with_retry(
+        &mut self,
+        cmd: &[u8],
+    ) -> Result<crate::vec::FrameVec, ReaderError<T::Error>> {
+        let mut last_err = None;
+        for _ in 0..=self.max_retries {
+            match self.transceiver.transceive(cmd) {
+                Ok(raw) => return Ok(raw),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(ReaderError::Transceiver(last_err.unwrap()))
+    }
+
     /// Read 4 blocks (16 bytes) starting at `block_no` in the current sector.
     ///
     /// Results are cached; subsequent reads of the same block will
-    /// be served from the cache without an RF transaction.
+    /// be served from the cache without an RF transaction. Transceiver
+    /// errors are retried up to `max_retries` times.
     pub fn read(&mut self, block_no: u8) -> Result<[u8; 16], ReaderError<T::Error>> {
         if let Some(cached_block) = self.cache_block {
             if block_no == cached_block {
@@ -68,10 +100,7 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
         }
 
         let cmd = Command::Read { block_no };
-        let raw = self
-            .transceiver
-            .transceive(&cmd.to_bytes())
-            .map_err(ReaderError::Transceiver)?;
+        let raw = self.transceive_with_retry(&cmd.to_bytes())?;
         match cmd.parse_answer(&raw)? {
             Answer::Data(data) => {
                 self.cache_block = Some(block_no);
@@ -86,12 +115,10 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
     /// Write 4 bytes to `block_no` in the current sector.
     ///
     /// Invalidates the read cache since the tag memory has changed.
+    /// Transceiver errors are retried up to `max_retries` times.
     pub fn write(&mut self, block_no: u8, data: [u8; 4]) -> Result<(), ReaderError<T::Error>> {
         let cmd = Command::Write { block_no, data };
-        let raw = self
-            .transceiver
-            .transceive(&cmd.to_bytes())
-            .map_err(ReaderError::Transceiver)?;
+        let raw = self.transceive_with_retry(&cmd.to_bytes())?;
         self.invalidate_cache();
         match cmd.parse_answer(&raw)? {
             Answer::Ack => Ok(()),
@@ -104,18 +131,17 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
     ///
     /// Sends SECTOR SELECT Packet 1, expects ACK, then sends Packet 2
     /// and expects passive ACK (silence). Invalidates the read cache.
+    /// Packet 1 retries on transceiver errors; Packet 2 does not retry
+    /// since passive ACK (silence) makes retry semantics ambiguous.
     pub fn sector_select(&mut self, sector: u8) -> Result<(), ReaderError<T::Error>> {
         if sector == self.current_sector {
             return Ok(());
         }
         self.invalidate_cache();
 
-        // Packet 1: [0xC2, 0xFF]
+        // Packet 1: [0xC2, 0xFF] — retries on transceiver error.
         let cmd1 = Command::SectorSelectPart1;
-        let raw = self
-            .transceiver
-            .transceive(&cmd1.to_bytes())
-            .map_err(ReaderError::Transceiver)?;
+        let raw = self.transceive_with_retry(&cmd1.to_bytes())?;
         match cmd1.parse_answer(&raw)? {
             Answer::Ack => {}
             Answer::Nack(code) => return Err(Type2Error::Nack(code).into()),
@@ -725,5 +751,67 @@ mod tests {
         }
         // 3 transceives: read + write + read (cache invalidated by write).
         assert_eq!(mock.transceive_count, 3);
+    }
+
+    /// Mock transceiver that fails N times then succeeds.
+    struct FailingTransceiver {
+        inner: MockTransceiver,
+        failures_remaining: usize,
+    }
+
+    impl FailingTransceiver {
+        fn new(fail_count: usize) -> Self {
+            FailingTransceiver {
+                inner: MockTransceiver::new(),
+                failures_remaining: fail_count,
+            }
+        }
+    }
+
+    impl T2TTransceiver for FailingTransceiver {
+        type Error = ();
+
+        fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec, ()> {
+            if self.failures_remaining > 0 {
+                self.failures_remaining -= 1;
+                return Err(());
+            }
+            self.inner.transceive(cmd)
+        }
+
+        fn transceive_no_response(&mut self, cmd: &[u8]) -> Result<Option<u8>, ()> {
+            self.inner.transceive_no_response(cmd)
+        }
+    }
+
+    #[test]
+    fn retry_on_transient_error() {
+        let mut mock = FailingTransceiver::new(1);
+        mock.inner.setup_static_with_ndef();
+        let mut reader = T2TReader::new(&mut mock);
+        reader.set_max_retries(1);
+
+        let data = reader.read(3).unwrap();
+        assert_eq!(data[0], 0xE1);
+    }
+
+    #[test]
+    fn retry_exhausted() {
+        let mut mock = FailingTransceiver::new(3);
+        mock.inner.setup_static_with_ndef();
+        let mut reader = T2TReader::new(&mut mock);
+        reader.set_max_retries(1); // 2 attempts total, 3 failures.
+
+        assert!(reader.read(3).is_err());
+    }
+
+    #[test]
+    fn retry_disabled() {
+        let mut mock = FailingTransceiver::new(1);
+        mock.inner.setup_static_with_ndef();
+        let mut reader = T2TReader::new(&mut mock);
+        reader.set_max_retries(0);
+
+        assert!(reader.read(3).is_err());
     }
 }
