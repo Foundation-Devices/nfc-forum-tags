@@ -31,9 +31,13 @@ impl<E> From<Type2Error> for ReaderError<E> {
 /// High-level NFC Forum Type 2 Tag reader/writer.
 ///
 /// Wraps a [`T2TTransceiver`] and tracks the currently selected sector.
+/// Maintains a 16-byte read cache to avoid redundant RF transactions.
 pub struct T2TReader<'t, T: T2TTransceiver> {
     transceiver: &'t mut T,
     current_sector: u8,
+    /// Cached 16-byte READ result: (block_no, data).
+    cache_block: Option<u8>,
+    cache_data: [u8; 16],
 }
 
 impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
@@ -42,30 +46,53 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
         T2TReader {
             transceiver,
             current_sector: 0,
+            cache_block: None,
+            cache_data: [0u8; 16],
         }
     }
 
+    /// Invalidate the read cache.
+    fn invalidate_cache(&mut self) {
+        self.cache_block = None;
+    }
+
     /// Read 4 blocks (16 bytes) starting at `block_no` in the current sector.
+    ///
+    /// Results are cached; subsequent reads of the same block will
+    /// be served from the cache without an RF transaction.
     pub fn read(&mut self, block_no: u8) -> Result<[u8; 16], ReaderError<T::Error>> {
+        if let Some(cached_block) = self.cache_block {
+            if block_no == cached_block {
+                return Ok(self.cache_data);
+            }
+        }
+
         let cmd = Command::Read { block_no };
         let raw = self
             .transceiver
             .transceive(&cmd.to_bytes())
             .map_err(ReaderError::Transceiver)?;
         match cmd.parse_answer(&raw)? {
-            Answer::Data(data) => Ok(data),
+            Answer::Data(data) => {
+                self.cache_block = Some(block_no);
+                self.cache_data = data;
+                Ok(data)
+            }
             Answer::Nack(code) => Err(Type2Error::Nack(code).into()),
             _ => Err(Type2Error::InvalidLength.into()),
         }
     }
 
     /// Write 4 bytes to `block_no` in the current sector.
+    ///
+    /// Invalidates the read cache since the tag memory has changed.
     pub fn write(&mut self, block_no: u8, data: [u8; 4]) -> Result<(), ReaderError<T::Error>> {
         let cmd = Command::Write { block_no, data };
         let raw = self
             .transceiver
             .transceive(&cmd.to_bytes())
             .map_err(ReaderError::Transceiver)?;
+        self.invalidate_cache();
         match cmd.parse_answer(&raw)? {
             Answer::Ack => Ok(()),
             Answer::Nack(code) => Err(Type2Error::Nack(code).into()),
@@ -76,11 +103,12 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
     /// Select a sector (for tags > 1 KB).
     ///
     /// Sends SECTOR SELECT Packet 1, expects ACK, then sends Packet 2
-    /// and expects passive ACK (silence).
+    /// and expects passive ACK (silence). Invalidates the read cache.
     pub fn sector_select(&mut self, sector: u8) -> Result<(), ReaderError<T::Error>> {
         if sector == self.current_sector {
             return Ok(());
         }
+        self.invalidate_cache();
 
         // Packet 1: [0xC2, 0xFF]
         let cmd1 = Command::SectorSelectPart1;
@@ -140,9 +168,8 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
         let mut byte_addr = start_byte_addr;
 
         // Read block by block (4 bytes at a time) to handle skip areas.
-        // We use READ which returns 16 bytes (4 blocks), but we process
-        // one block at a time to properly skip lock/reserved areas.
-        let mut read_cache: Option<(u8, [u8; 16])> = None;
+        // The persistent cache in T2TReader avoids redundant RF reads
+        // when blocks fall within the same 16-byte READ response.
 
         'outer: while bytes_read < total_bytes {
             let (sector, block, _) = MemoryLayout::address_to_sector_block(byte_addr);
@@ -152,29 +179,28 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
                 self.sector_select(sector)?;
             }
 
-            // Check if we have this block cached from a previous READ.
-            let block_data = if let Some((cached_block, ref cached_data)) = read_cache {
-                let blocks_ahead = block.wrapping_sub(cached_block);
-                if blocks_ahead < 4 {
-                    // This block is in the cache.
-                    let offset = blocks_ahead as usize * BLOCK_SIZE;
+            // Extract the 4 bytes for this block from a 16-byte READ.
+            // The persistent cache handles deduplication across calls.
+            let block_data = {
+                let cached = self.cache_block.and_then(|cb| {
+                    let ahead = block.wrapping_sub(cb);
+                    if ahead < 4 {
+                        Some(ahead as usize)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(blocks_ahead) = cached {
+                    let offset = blocks_ahead * BLOCK_SIZE;
                     let mut b = [0u8; 4];
-                    b.copy_from_slice(&cached_data[offset..offset + BLOCK_SIZE]);
+                    b.copy_from_slice(&self.cache_data[offset..offset + BLOCK_SIZE]);
                     b
                 } else {
-                    // Need a new READ.
                     let data = self.read(block)?;
-                    read_cache = Some((block, data));
                     let mut b = [0u8; 4];
                     b.copy_from_slice(&data[..BLOCK_SIZE]);
                     b
                 }
-            } else {
-                let data = self.read(block)?;
-                read_cache = Some((block, data));
-                let mut b = [0u8; 4];
-                b.copy_from_slice(&data[..BLOCK_SIZE]);
-                b
             };
 
             // Process each byte in this block.
@@ -220,11 +246,7 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
 
         let layout = MemoryLayout::from_cc_and_tlvs(&cc, &[]);
         let data_area = self.read_data_area(&layout)?;
-
         let tlvs = tlv::parse_tlvs(&data_area).map_err(ReaderError::Protocol)?;
-
-        // Re-derive layout with TLV info for completeness.
-        let _layout = MemoryLayout::from_cc_and_tlvs(&cc, &tlvs);
 
         // Find the first NDEF Message TLV.
         for tlv in &tlvs {
@@ -259,8 +281,10 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
 
         // Read the data area to find the NDEF Message TLV position.
         let layout = MemoryLayout::from_cc_and_tlvs(&cc, &[]);
+        let data_area = self.read_data_area(&layout)?;
+        let tlvs = tlv::parse_tlvs(&data_area).map_err(ReaderError::Protocol)?;
 
-        // Calculate available space: data_area_size minus Lock/Memory Control TLVs.
+        // Calculate available space.
         let ndef_len = ndef_data.len() as u16;
         let l_field_size: u16 = if ndef_len < 0xFF { 1 } else { 3 };
         let total_ndef_tlv_size = 1 + l_field_size + ndef_len; // T + L + V
@@ -269,14 +293,6 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
         if total_ndef_tlv_size + terminator_size > cc.data_area_size() {
             return Err(Type2Error::OutOfRange.into());
         }
-
-        // We need to find where the first NDEF Message TLV starts in the
-        // block structure. For simplicity, read block 4 to find TLV start.
-        // In a static tag, NDEF TLV starts at block 4 byte 0.
-        // In a dynamic tag, it follows Lock/Memory Control TLVs.
-
-        let data_area = self.read_data_area(&layout)?;
-        let tlvs = tlv::parse_tlvs(&data_area).map_err(ReaderError::Protocol)?;
 
         // Find the byte offset of the first NDEF Message TLV within the data area.
         let mut ndef_tlv_offset: Option<usize> = None;
@@ -570,6 +586,34 @@ mod tests {
         }
     }
 
+    /// Mock transceiver that counts RF transactions.
+    struct CountingTransceiver {
+        inner: MockTransceiver,
+        transceive_count: usize,
+    }
+
+    impl CountingTransceiver {
+        fn new() -> Self {
+            CountingTransceiver {
+                inner: MockTransceiver::new(),
+                transceive_count: 0,
+            }
+        }
+    }
+
+    impl T2TTransceiver for CountingTransceiver {
+        type Error = ();
+
+        fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec, ()> {
+            self.transceive_count += 1;
+            self.inner.transceive(cmd)
+        }
+
+        fn transceive_no_response(&mut self, cmd: &[u8]) -> Result<Option<u8>, ()> {
+            self.inner.transceive_no_response(cmd)
+        }
+    }
+
     #[test]
     fn read_cc_from_mock() {
         let mut mock = MockTransceiver::new();
@@ -641,5 +685,45 @@ mod tests {
         // Read it back.
         let data = reader.read(4).unwrap();
         assert_eq!(&data[..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn read_cache_hit() {
+        let mut mock = CountingTransceiver::new();
+        mock.inner.setup_static_with_ndef();
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            let _ = reader.read(3).unwrap();
+            let _ = reader.read(3).unwrap();
+        }
+        // Only 1 transceive: second read served from cache.
+        assert_eq!(mock.transceive_count, 1);
+    }
+
+    #[test]
+    fn read_cache_miss_different_block() {
+        let mut mock = CountingTransceiver::new();
+        mock.inner.setup_static_with_ndef();
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            let _ = reader.read(3).unwrap();
+            let _ = reader.read(8).unwrap();
+        }
+        // 2 transceives: different blocks, cache miss on second.
+        assert_eq!(mock.transceive_count, 2);
+    }
+
+    #[test]
+    fn write_invalidates_cache() {
+        let mut mock = CountingTransceiver::new();
+        mock.inner.setup_static_with_ndef();
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            let _ = reader.read(4).unwrap();
+            reader.write(4, [0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+            let _ = reader.read(4).unwrap();
+        }
+        // 3 transceives: read + write + read (cache invalidated by write).
+        assert_eq!(mock.transceive_count, 3);
     }
 }
