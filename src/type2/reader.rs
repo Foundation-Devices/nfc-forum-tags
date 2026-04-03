@@ -119,7 +119,10 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
 
     /// Read the raw data area bytes, skipping lock and reserved areas.
     ///
-    /// Returns the contiguous data area bytes with lock/reserved regions removed.
+    /// Returns the contiguous data area bytes with lock/reserved regions
+    /// removed. Stops early when a Terminator TLV (`0xFE`) is encountered
+    /// at a TLV tag position, avoiding unnecessary reads past the end of
+    /// meaningful data.
     pub fn read_data_area(
         &mut self,
         layout: &MemoryLayout,
@@ -128,10 +131,12 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
         let total_bytes = layout.data_area_size;
         let mut bytes_read = 0u16;
 
+        // Lightweight TLV scanner to detect the Terminator TLV (0xFE)
+        // during reading, so we can stop early and avoid unnecessary reads.
+        let mut tlv_scan = TlvScanner::new();
+
         // Start reading from block 4.
         let start_byte_addr = DATA_START_BLOCK as u16 * BLOCK_SIZE as u16;
-        // We need to read enough blocks to cover data_area_size plus any
-        // interspersed lock/reserved areas.
         let mut byte_addr = start_byte_addr;
 
         // Read block by block (4 bytes at a time) to handle skip areas.
@@ -139,7 +144,7 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
         // one block at a time to properly skip lock/reserved areas.
         let mut read_cache: Option<(u8, [u8; 16])> = None;
 
-        while bytes_read < total_bytes {
+        'outer: while bytes_read < total_bytes {
             let (sector, block, _) = MemoryLayout::address_to_sector_block(byte_addr);
 
             // Switch sector if needed.
@@ -178,9 +183,15 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
                 if layout.is_skip_area(addr) {
                     continue;
                 }
-                if bytes_read < total_bytes {
-                    result.try_push(byte).map_err(Type2Error::from)?;
-                    bytes_read += 1;
+                if bytes_read >= total_bytes {
+                    break 'outer;
+                }
+
+                result.try_push(byte).map_err(Type2Error::from)?;
+                bytes_read += 1;
+
+                if tlv_scan.feed(byte) {
+                    break 'outer;
                 }
             }
 
@@ -366,6 +377,78 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
         // Write back.
         self.write(block, block_data)?;
         Ok(())
+    }
+}
+
+/// Lightweight TLV boundary scanner for detecting the Terminator TLV
+/// during data area reads. Tracks position within the TLV stream so
+/// that `0xFE` bytes inside TLV values are not mistaken for a Terminator.
+///
+/// Feed bytes one at a time via [`feed`]; returns `true` when the
+/// Terminator TLV tag is encountered at a valid TLV boundary.
+enum TlvScanState {
+    /// Next byte is a TLV tag.
+    Tag,
+    /// Next byte is the first length byte.
+    Length,
+    /// Read first byte of 3-byte extended length; waiting for MSB.
+    LengthExtMsb,
+    /// Read MSB of extended length; waiting for LSB.
+    LengthExtLsb(u8),
+    /// Skipping `remaining` value bytes.
+    Value(u16),
+}
+
+struct TlvScanner {
+    state: TlvScanState,
+}
+
+impl TlvScanner {
+    fn new() -> Self {
+        Self {
+            state: TlvScanState::Tag,
+        }
+    }
+
+    /// Feed the next data byte. Returns `true` if this byte is a
+    /// Terminator TLV tag (0xFE), meaning the caller should stop reading.
+    fn feed(&mut self, byte: u8) -> bool {
+        match self.state {
+            TlvScanState::Tag => match byte {
+                tlv::TLV_TERMINATOR => return true,
+                tlv::TLV_NULL => {} // No L/V, stay in Tag state.
+                _ => self.state = TlvScanState::Length,
+            },
+            TlvScanState::Length => {
+                if byte == 0xFF {
+                    // 3-byte length: 0xFF + MSB + LSB.
+                    self.state = TlvScanState::LengthExtMsb;
+                } else if byte == 0 {
+                    self.state = TlvScanState::Tag;
+                } else {
+                    self.state = TlvScanState::Value(byte as u16);
+                }
+            }
+            TlvScanState::LengthExtMsb => {
+                self.state = TlvScanState::LengthExtLsb(byte);
+            }
+            TlvScanState::LengthExtLsb(msb) => {
+                let len = (msb as u16) << 8 | byte as u16;
+                if len == 0 {
+                    self.state = TlvScanState::Tag;
+                } else {
+                    self.state = TlvScanState::Value(len);
+                }
+            }
+            TlvScanState::Value(remaining) => {
+                if remaining <= 1 {
+                    self.state = TlvScanState::Tag;
+                } else {
+                    self.state = TlvScanState::Value(remaining - 1);
+                }
+            }
+        }
+        false
     }
 }
 
