@@ -253,6 +253,37 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
         Ok(result)
     }
 
+    /// Read the data area, parse TLVs, and return the NDEF data area bytes.
+    ///
+    /// For dynamic tags with Lock/Memory Control TLVs, performs a
+    /// two-pass read: first pass discovers the control TLVs, second
+    /// pass re-reads with the proper layout that skips lock/reserved
+    /// areas. For static tags, a single pass suffices.
+    ///
+    /// The persistent read cache makes the second pass cheap when
+    /// blocks overlap with the first pass.
+    fn read_data_area_with_layout(
+        &mut self,
+        cc: &CapabilityContainer,
+    ) -> Result<DataVec, ReaderError<T::Error>> {
+        let basic_layout = MemoryLayout::from_cc_and_tlvs(cc, &[]);
+        let data_area = self.read_data_area(&basic_layout)?;
+        let tlvs = tlv::parse_tlvs(&data_area).map_err(ReaderError::Protocol)?;
+
+        // For dynamic tags: if Lock/Memory Control TLVs were found,
+        // re-read with the proper layout that skips those areas.
+        if cc.is_dynamic()
+            && tlvs
+                .iter()
+                .any(|t| matches!(t, Tlv::LockControl(_) | Tlv::MemoryControl(_)))
+        {
+            let full_layout = MemoryLayout::from_cc_and_tlvs(cc, &tlvs);
+            self.read_data_area(&full_layout)
+        } else {
+            Ok(data_area)
+        }
+    }
+
     /// Detect and read the NDEF message from the tag.
     ///
     /// Performs the NDEF detection procedure (Section 6.4.1):
@@ -270,8 +301,7 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
             return Err(Type2Error::InvalidMagic(0).into());
         }
 
-        let layout = MemoryLayout::from_cc_and_tlvs(&cc, &[]);
-        let data_area = self.read_data_area(&layout)?;
+        let data_area = self.read_data_area_with_layout(&cc)?;
         let tlvs = tlv::parse_tlvs(&data_area).map_err(ReaderError::Protocol)?;
 
         // Find the first NDEF Message TLV.
@@ -306,8 +336,7 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
         }
 
         // Read the data area to find the NDEF Message TLV position.
-        let layout = MemoryLayout::from_cc_and_tlvs(&cc, &[]);
-        let data_area = self.read_data_area(&layout)?;
+        let data_area = self.read_data_area_with_layout(&cc)?;
         let tlvs = tlv::parse_tlvs(&data_area).map_err(ReaderError::Protocol)?;
 
         // Calculate available space.
