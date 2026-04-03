@@ -8,11 +8,20 @@
 //! these are fixed-capacity [`heapless::Vec`]s; with the `alloc` feature
 //! they become standard [`Vec`]s.
 
-/// Buffer for command/response frames (max 20 bytes covers the 16-byte READ response).
+/// Buffer for command/response frames.
+///
+/// The capacity is chosen by the [`T2TTransceiver`](super::type2::T2TTransceiver)
+/// implementor via its const generic `N`. For standard T2T operations
+/// (READ, WRITE, SECTOR SELECT), **20 bytes is sufficient**. Vendor-specific
+/// commands that return larger responses (e.g., bulk reads) may require a
+/// bigger buffer — the implementor sets `N` accordingly.
+///
+/// With the `alloc` feature this is an unbounded `Vec<u8>` and `N` is
+/// ignored at the type level.
 #[cfg(feature = "alloc")]
 pub type FrameVec = alloc::vec::Vec<u8>;
 #[cfg(not(feature = "alloc"))]
-pub type FrameVec = heapless::Vec<u8, 20>;
+pub type FrameVec<const N: usize = 20> = heapless::Vec<u8, N>;
 
 /// Buffer for larger data: NDEF messages, full sector reads (up to 1024 bytes).
 #[cfg(feature = "alloc")]

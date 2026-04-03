@@ -72,7 +72,15 @@ impl From<BufferFullError> for Type2Error {
 ///
 /// A typical implementation wraps an `iso14443::PcdTransceiver` and
 /// forwards commands as `Frame::Standard`.
-pub trait T2TTransceiver {
+///
+/// # Frame buffer size (`N`)
+///
+/// The const generic `N` sets the capacity of the response buffer
+/// ([`FrameVec`]). For standard T2T operations (READ, WRITE, SECTOR
+/// SELECT), **20 bytes is sufficient**. Vendor-specific commands that
+/// return larger responses require a bigger buffer — set `N`
+/// accordingly. With the `alloc` feature `N` is ignored.
+pub trait T2TTransceiver<const N: usize = 20> {
     type Error;
 
     /// Transmit a command and receive the response.
@@ -80,7 +88,7 @@ pub trait T2TTransceiver {
     /// - For READ: returns 16 payload bytes (CRC already stripped).
     /// - For WRITE / SECTOR SELECT Packet 1: returns a single byte
     ///   containing the 4-bit ACK (0x0A) or NACK value.
-    fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec, Self::Error>;
+    fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec<N>, Self::Error>;
 
     /// Transmit a command expecting silence (passive ACK) or a NACK.
     ///

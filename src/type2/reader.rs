@@ -36,7 +36,7 @@ const DEFAULT_MAX_RETRIES: u8 = 1;
 /// Wraps a [`T2TTransceiver`] and tracks the currently selected sector.
 /// Maintains a 16-byte read cache to avoid redundant RF transactions.
 /// Retries transient transceiver errors up to `max_retries` times.
-pub struct T2TReader<'t, T: T2TTransceiver> {
+pub struct T2TReader<'t, T: T2TTransceiver<N>, const N: usize> {
     transceiver: &'t mut T,
     current_sector: u8,
     /// Cached 16-byte READ result: (block_no, data).
@@ -46,7 +46,7 @@ pub struct T2TReader<'t, T: T2TTransceiver> {
     max_retries: u8,
 }
 
-impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
+impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
     /// Create a new reader. The default sector is 0.
     pub fn new(transceiver: &'t mut T) -> Self {
         T2TReader {
@@ -96,7 +96,7 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
     pub fn transceive_with_retry(
         &mut self,
         cmd: &[u8],
-    ) -> Result<crate::vec::FrameVec, ReaderError<T::Error>> {
+    ) -> Result<crate::vec::FrameVec<N>, ReaderError<T::Error>> {
         let mut last_err = None;
         for _ in 0..=self.max_retries {
             match self.transceiver.transceive(cmd) {
