@@ -10,6 +10,7 @@
 //! - CC3: access conditions (read | write nibbles)
 
 use super::Type2Error;
+use crate::tag::{AccessCondition, TagState};
 
 /// Magic number indicating NFC Forum defined data.
 pub const CC_MAGIC: u8 = 0xE1;
@@ -30,52 +31,6 @@ pub struct CapabilityContainer {
     pub read_access: AccessCondition,
     /// Write access condition (lower nibble of CC3).
     pub write_access: AccessCondition,
-}
-
-/// Access condition for read or write (4-bit nibble from CC3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccessCondition {
-    /// 0x0: access granted without any security.
-    Granted,
-    /// 0xF: no access granted (read-only for write, or denied for read).
-    Denied,
-    /// 0x8–0xE: proprietary access condition.
-    Proprietary(u8),
-    /// 0x1–0x7: reserved for future use.
-    Rfu(u8),
-}
-
-impl AccessCondition {
-    /// Parse a 4-bit nibble into an access condition.
-    pub fn from_nibble(nibble: u8) -> Self {
-        match nibble {
-            0x00 => AccessCondition::Granted,
-            0x0F => AccessCondition::Denied,
-            0x08..=0x0E => AccessCondition::Proprietary(nibble),
-            _ => AccessCondition::Rfu(nibble),
-        }
-    }
-
-    /// Encode as a 4-bit nibble.
-    pub fn to_nibble(self) -> u8 {
-        match self {
-            AccessCondition::Granted => 0x00,
-            AccessCondition::Denied => 0x0F,
-            AccessCondition::Proprietary(v) => v,
-            AccessCondition::Rfu(v) => v,
-        }
-    }
-}
-
-/// Tag lifecycle state derived from CC and NDEF TLV content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TagState {
-    /// CC valid, NDEF Message TLV present with L=0.
-    Initialized,
-    /// CC valid (CC3=0x00), NDEF Message TLV with L≠0.
-    ReadWrite,
-    /// CC valid (CC3=0x0F), NDEF Message TLV with L≠0, all locks set.
-    ReadOnly,
 }
 
 impl CapabilityContainer {

@@ -16,6 +16,7 @@
 //! | FEh | Terminator       | —       | —                    |
 
 use super::Type2Error;
+use crate::tlv::{self as shared_tlv, TlvError};
 use crate::vec::{DataVec, VecExt};
 
 /// TLV tag field values.
@@ -173,33 +174,15 @@ impl MemoryControlValue {
 ///
 /// Returns `(length_value, bytes_consumed)`.
 fn parse_tlv_length(data: &[u8], offset: usize) -> Result<(u16, usize), Type2Error> {
-    if offset >= data.len() {
-        return Err(Type2Error::InvalidTlv);
-    }
-
-    let first = data[offset];
-    if first < 0xFF {
-        // One-byte format: 0x00–0xFE.
-        Ok((first as u16, 1))
-    } else {
-        // Three-byte format: 0xFF followed by 2-byte big-endian length.
-        if offset + 3 > data.len() {
-            return Err(Type2Error::InvalidTlv);
-        }
-        let len = u16::from_be_bytes([data[offset + 1], data[offset + 2]]);
-        Ok((len, 3))
-    }
+    shared_tlv::parse_tlv_length(data, offset).map_err(|_| Type2Error::InvalidTlv)
 }
 
 /// Encode a TLV length field into `out`.
 fn encode_tlv_length(len: u16, out: &mut DataVec) -> Result<(), Type2Error> {
-    if len < 0xFF {
-        out.try_push(len as u8)?;
-    } else {
-        out.try_push(0xFF)?;
-        out.try_extend(&len.to_be_bytes())?;
-    }
-    Ok(())
+    shared_tlv::encode_tlv_length(len, out).map_err(|e| match e {
+        TlvError::BufferFull => Type2Error::BufferFull,
+        TlvError::InvalidTlv => Type2Error::InvalidTlv,
+    })
 }
 
 /// Parse a sequence of TLV blocks from the data area.

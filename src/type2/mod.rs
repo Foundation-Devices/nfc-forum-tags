@@ -22,7 +22,8 @@ pub mod memory;
 pub mod reader;
 pub mod tlv;
 
-pub use cc::{AccessCondition, CapabilityContainer, TagState};
+pub use crate::tag::{AccessCondition, TagState};
+pub use cc::CapabilityContainer;
 pub use memory::{LockArea, MemoryLayout, ReservedArea};
 pub use reader::{ReaderError, T2TReader};
 pub use tlv::{LockControlValue, MemoryControlValue, Tlv};
@@ -64,12 +65,13 @@ impl From<BufferFullError> for Type2Error {
 
 /// Hardware abstraction for NFC Type 2 Tag communication.
 ///
-/// Implementors handle the physical layer including CRC_A.
-/// Commands are provided **without** CRC; the transceiver appends
-/// CRC_A on transmit and validates/strips it on receive.
+/// This trait sits above the ISO14443-3A layer (`iso14443::PcdTransceiver`).
+/// Commands are provided **without** CRC_A; the CRC is
+/// transparent to this trait: implementors receive commands without CRC
+/// and return responses with CRC already validated and stripped.
 ///
-/// This trait is intentionally independent of `iso14443::PcdTransceiver`.
-/// A thin adapter can bridge the two.
+/// A typical implementation wraps an `iso14443::PcdTransceiver` and
+/// forwards commands as `Frame::Standard`.
 pub trait T2TTransceiver {
     type Error;
 

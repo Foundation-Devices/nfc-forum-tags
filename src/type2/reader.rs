@@ -6,10 +6,11 @@
 //! [`T2TReader`] orchestrates command sequences for NDEF detection,
 //! reading, and writing on a Type 2 Tag after ISO 14443-3A activation.
 
-use super::cc::{AccessCondition, CapabilityContainer};
+use super::cc::CapabilityContainer;
 use super::memory::{BLOCK_SIZE, CC_BLOCK, DATA_START_BLOCK, MemoryLayout};
 use super::tlv::{self, Tlv};
 use super::{Answer, Command, T2TTransceiver, Type2Error};
+use crate::tag::AccessCondition;
 use crate::vec::{DataVec, VecExt};
 
 /// Errors from the T2T reader, wrapping transport and protocol errors.

@@ -12,6 +12,12 @@ No dependency on either crate — raw `&[u8]` at both boundaries.
 
 ## Functionalities
 
+### Shared
+
+- **TLV length encoding**: 1-byte / 3-byte format used by all NFC Forum tag types
+- **Tag state**: `Initialized`, `ReadWrite`, `ReadOnly` lifecycle states
+- **Access conditions**: `Granted`, `Denied`, `Proprietary`, `Rfu`
+
 ### Type 2 Tag (T2TOP 1.1)
 
 - **Commands**: READ (0x30), WRITE (0xA2), SECTOR SELECT (0xC2)
