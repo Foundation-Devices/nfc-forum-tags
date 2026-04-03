@@ -67,13 +67,33 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
         self.max_retries = n;
     }
 
+    /// Get the currently selected sector number.
+    pub fn current_sector(&self) -> u8 {
+        self.current_sector
+    }
+
+    /// Get a mutable reference to the underlying transceiver.
+    ///
+    /// Useful for sending custom commands (e.g., NTAG-specific extensions)
+    /// that are not part of the T2T spec.
+    pub fn transceiver(&mut self) -> &mut T {
+        self.transceiver
+    }
+
     /// Invalidate the read cache.
-    fn invalidate_cache(&mut self) {
+    ///
+    /// Call this after sending custom write commands directly through
+    /// the transceiver to ensure subsequent reads reflect the new state.
+    pub fn invalidate_cache(&mut self) {
         self.cache_block = None;
     }
 
     /// Transceive with retry on transceiver errors.
-    fn transceive_with_retry(
+    ///
+    /// Retries up to `max_retries` times on transceiver-level errors.
+    /// Useful for sending custom commands with the same retry behavior
+    /// as the built-in READ/WRITE.
+    pub fn transceive_with_retry(
         &mut self,
         cmd: &[u8],
     ) -> Result<crate::vec::FrameVec, ReaderError<T::Error>> {
