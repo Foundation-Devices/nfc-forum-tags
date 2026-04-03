@@ -308,59 +308,87 @@ impl<'t, T: T2TTransceiver> T2TReader<'t, T> {
 
         let ndef_offset = ndef_tlv_offset.ok_or(Type2Error::InvalidTlv)?;
 
-        // Build the new TLV sequence starting at ndef_offset:
-        // Step 1: Write T=03, L=00 (set length to 0 first for crash safety).
         let data_start_addr = DATA_START_BLOCK as u16 * BLOCK_SIZE as u16;
         let ndef_byte_addr = data_start_addr + ndef_offset as u16;
 
-        // We need to write block-by-block. First write the NDEF TLV header
-        // with L=0, then the data, then update L.
-
-        // Build the full byte sequence: [03, L=00, ...ndef_data..., FE]
-        // Then we'll go back and fix L.
-
-        // Phase 1: Write T=03, L=00 at the NDEF TLV position.
-        self.write_byte_at(ndef_byte_addr, 0x03, &layout)?;
-        self.write_byte_at(ndef_byte_addr + 1, 0x00, &layout)?;
-
-        // Phase 2: Write NDEF data starting after T+L (1-byte L for now).
-        let v_start = if ndef_len < 0xFF {
-            ndef_byte_addr + 2 // T(1) + L(1)
-        } else {
-            ndef_byte_addr + 4 // T(1) + L(3)
-        };
-
-        for (i, &byte) in ndef_data.iter().enumerate() {
-            self.write_byte_at(v_start + i as u16, byte, &layout)?;
-        }
-
-        // Phase 3: Write Terminator TLV after the NDEF data.
-        let terminator_addr = v_start + ndef_len;
-        // Only write terminator if there's room.
-        if terminator_addr < data_start_addr + cc.data_area_size() {
-            self.write_byte_at(terminator_addr, 0xFE, &layout)?;
-        }
-
-        // Phase 4: Update L field with actual length.
+        // Build the full byte sequence to write:
+        // [T=0x03, L=0x00, ...ndef_data..., T=0xFE]
+        // L is initially 0 for crash safety (Section 6.4.3), then updated
+        // to the real length at the end.
+        let mut payload = DataVec::new();
+        payload
+            .try_push(tlv::TLV_NDEF_MESSAGE)
+            .map_err(Type2Error::from)?; // T
         if ndef_len < 0xFF {
-            self.write_byte_at(ndef_byte_addr + 1, ndef_len as u8, &layout)?;
+            payload.try_push(0x00).map_err(Type2Error::from)?;
         } else {
-            self.write_byte_at(ndef_byte_addr + 1, 0xFF, &layout)?;
-            self.write_byte_at(ndef_byte_addr + 2, (ndef_len >> 8) as u8, &layout)?;
-            self.write_byte_at(ndef_byte_addr + 3, ndef_len as u8, &layout)?;
+            payload.try_push(0xFF).map_err(Type2Error::from)?;
+            payload.try_push(0x00).map_err(Type2Error::from)?;
+            payload.try_push(0x00).map_err(Type2Error::from)?;
+        }
+        payload.try_extend(ndef_data).map_err(Type2Error::from)?; // V
+        payload
+            .try_push(tlv::TLV_TERMINATOR)
+            .map_err(Type2Error::from)?;
+
+        // Write the payload page by page using read-modify-write for
+        // pages that are partially covered.
+        self.write_bytes_at(ndef_byte_addr, &payload)?;
+
+        // Update L field with actual length (atomic-ish: single page write).
+        if ndef_len < 0xFF {
+            self.write_byte_at(ndef_byte_addr + 1, ndef_len as u8)?;
+        } else {
+            // 3-byte length: [0xFF, MSB, LSB] at bytes 1..4 from T.
+            let l_bytes = [0xFF, (ndef_len >> 8) as u8, ndef_len as u8];
+            self.write_bytes_at(ndef_byte_addr + 1, &l_bytes)?;
         }
 
         Ok(())
     }
 
+    /// Write a contiguous byte sequence starting at `start_addr`, using
+    /// page-level writes. Partial pages at the start and end are handled
+    /// via read-modify-write; full pages are written directly.
+    fn write_bytes_at(
+        &mut self,
+        start_addr: u16,
+        data: &[u8],
+    ) -> Result<(), ReaderError<T::Error>> {
+        let mut addr = start_addr;
+        let mut remaining = data;
+
+        while !remaining.is_empty() {
+            let (sector, block, offset) = MemoryLayout::address_to_sector_block(addr);
+            if sector != self.current_sector {
+                self.sector_select(sector)?;
+            }
+
+            let o = offset as usize;
+            let can_write = BLOCK_SIZE - o; // bytes we can place in this page
+            let n = remaining.len().min(can_write);
+
+            if o == 0 && n == BLOCK_SIZE {
+                // Full page — write directly, no read needed.
+                let page = [remaining[0], remaining[1], remaining[2], remaining[3]];
+                self.write(block, page)?;
+            } else {
+                // Partial page — read-modify-write.
+                let cur = self.read(block)?;
+                let mut page = [cur[0], cur[1], cur[2], cur[3]];
+                page[o..o + n].copy_from_slice(&remaining[..n]);
+                self.write(block, page)?;
+            }
+
+            remaining = &remaining[n..];
+            addr += n as u16;
+        }
+        Ok(())
+    }
+
     /// Write a single byte at a given byte address, doing a read-modify-write
     /// on the containing block.
-    fn write_byte_at(
-        &mut self,
-        byte_addr: u16,
-        value: u8,
-        _layout: &MemoryLayout,
-    ) -> Result<(), ReaderError<T::Error>> {
+    fn write_byte_at(&mut self, byte_addr: u16, value: u8) -> Result<(), ReaderError<T::Error>> {
         let (sector, block, offset) = MemoryLayout::address_to_sector_block(byte_addr);
 
         if sector != self.current_sector {
