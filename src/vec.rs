@@ -19,7 +19,7 @@
 /// With the `alloc` feature this is an unbounded `Vec<u8>` and `N` is
 /// ignored at the type level.
 #[cfg(feature = "alloc")]
-pub type FrameVec = alloc::vec::Vec<u8>;
+pub type FrameVec<const N: usize = 20> = alloc::vec::Vec<u8>;
 #[cfg(not(feature = "alloc"))]
 pub type FrameVec<const N: usize = 20> = heapless::Vec<u8, N>;
 
