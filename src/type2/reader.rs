@@ -114,6 +114,19 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
         self.cache_block = None;
     }
 
+    /// Mark the tag's protocol state as unknown and drop the read cache.
+    ///
+    /// Call this after any custom command whose outcome is ambiguous — for
+    /// example a multi-phase vendor command whose acknowledgement was lost.
+    /// The next sector-relative operation re-establishes the sector rather than
+    /// trusting the previous value, and no stale bytes can be served from the
+    /// cache. The tag itself should be reactivated before another
+    /// state-changing command.
+    pub fn mark_tag_state_unknown(&mut self) {
+        self.sector = SectorState::Unknown;
+        self.invalidate_cache();
+    }
+
     /// Transceive with retry on transceiver errors.
     ///
     /// Retries up to `max_retries` times on transceiver-level errors.

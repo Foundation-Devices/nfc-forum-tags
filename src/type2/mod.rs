@@ -51,6 +51,15 @@ pub enum Type2Error {
     BufferFull,
     /// Block number or sector exceeds tag capacity.
     OutOfRange,
+    /// A state-dependent command failed in transport after the tag may already
+    /// have applied it, so the outcome is neither a definite success nor a
+    /// definite failure.
+    ///
+    /// Such a command must not be replayed: the same bytes can mean something
+    /// different once the tag has returned to command state. The caller must
+    /// reactivate the tag and read back the affected page before issuing
+    /// another state-changing command.
+    AmbiguousOutcome,
     /// Unknown command code when parsing.
     UnknownCommand(u8),
 }
