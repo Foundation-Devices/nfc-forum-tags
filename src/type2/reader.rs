@@ -359,15 +359,18 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
         let data_area = self.read_data_area_with_layout(&cc)?;
         let tlvs = tlv::parse_tlvs(&data_area).map_err(ReaderError::Protocol)?;
 
-        // Calculate available space.
-        let ndef_len = ndef_data.len() as u16;
-        let l_field_size: u16 = if ndef_len < 0xFF { 1 } else { 3 };
-        let total_ndef_tlv_size = 1 + l_field_size + ndef_len; // T + L + V
-        let terminator_size = 1u16; // Terminator TLV
-
-        if total_ndef_tlv_size + terminator_size > cc.data_area_size() {
+        // Reject lengths that cannot be encoded in the NDEF Message TLV
+        // length field before any arithmetic. The 3-byte length format is
+        // `0xFF` followed by a big-endian u16, and `0xFFFF` is reserved, so
+        // the largest encodable value is `0xFFFE`. Computing in `usize`
+        // avoids the silent `as u16` truncation that let a 65_536-byte
+        // input validate as length zero.
+        let ndef_len_usize = ndef_data.len();
+        if ndef_len_usize > 0xFFFE {
             return Err(Type2Error::OutOfRange.into());
         }
+        let ndef_len = ndef_len_usize as u16;
+        let l_field_size: usize = if ndef_len < 0xFF { 1 } else { 3 };
 
         // Find the byte offset of the first NDEF Message TLV within the data area.
         let mut ndef_tlv_offset: Option<usize> = None;
@@ -399,8 +402,32 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
 
         let ndef_offset = ndef_tlv_offset.ok_or(Type2Error::InvalidTlv)?;
 
+        // Prove the entire physical write plan stays within the CC data
+        // area before touching the tag. The span runs from the data-area
+        // start, past any preceding TLVs (`ndef_offset`), through
+        // T + L + V + Terminator. Using checked `usize` arithmetic and
+        // including `ndef_offset` closes both the wrapping overflow and the
+        // near-capacity overrun where a non-zero offset pushed the write
+        // past the end of the data area.
+        let required_end = ndef_offset
+            .checked_add(1) // T
+            .and_then(|x| x.checked_add(l_field_size)) // L
+            .and_then(|x| x.checked_add(ndef_len_usize)) // V
+            .and_then(|x| x.checked_add(1)) // Terminator
+            .ok_or(Type2Error::OutOfRange)?;
+        if required_end > cc.data_area_size() as usize {
+            return Err(Type2Error::OutOfRange.into());
+        }
+
         let data_start_addr = DATA_START_BLOCK as u16 * BLOCK_SIZE as u16;
         let ndef_byte_addr = data_start_addr + ndef_offset as u16;
+
+        // Exclusive physical write limit: no page write may touch this
+        // address or beyond. This is the byte just past the CC data area,
+        // which on NTAG sits exactly at the dynamic-lock page — keeping
+        // writes off the lock, configuration, PWD, and PACK pages even if
+        // the checks above were ever wrong. Defense in depth.
+        let write_limit_addr = data_start_addr + cc.data_area_size();
 
         // Build the full byte sequence to write:
         // [T=0x03, L=0x00, ...ndef_data..., T=0xFE]
@@ -424,15 +451,15 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
 
         // Write the payload page by page using read-modify-write for
         // pages that are partially covered.
-        self.write_bytes_at(ndef_byte_addr, &payload)?;
+        self.write_bytes_at(ndef_byte_addr, &payload, write_limit_addr)?;
 
         // Update L field with actual length (atomic-ish: single page write).
         if ndef_len < 0xFF {
-            self.write_byte_at(ndef_byte_addr + 1, ndef_len as u8)?;
+            self.write_byte_at(ndef_byte_addr + 1, ndef_len as u8, write_limit_addr)?;
         } else {
             // 3-byte length: [0xFF, MSB, LSB] at bytes 1..4 from T.
             let l_bytes = [0xFF, (ndef_len >> 8) as u8, ndef_len as u8];
-            self.write_bytes_at(ndef_byte_addr + 1, &l_bytes)?;
+            self.write_bytes_at(ndef_byte_addr + 1, &l_bytes, write_limit_addr)?;
         }
 
         Ok(())
@@ -441,10 +468,16 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
     /// Write a contiguous byte sequence starting at `start_addr`, using
     /// page-level writes. Partial pages at the start and end are handled
     /// via read-modify-write; full pages are written directly.
+    ///
+    /// `limit_addr` is an exclusive physical bound: any page write that
+    /// would touch `limit_addr` or beyond returns [`Type2Error::OutOfRange`]
+    /// before the write is issued. This is defense in depth against writes
+    /// escaping the CC data area into lock/configuration pages.
     fn write_bytes_at(
         &mut self,
         start_addr: u16,
         data: &[u8],
+        limit_addr: u16,
     ) -> Result<(), ReaderError<T::Error>> {
         let mut addr = start_addr;
         let mut remaining = data;
@@ -458,6 +491,11 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
             let o = offset as usize;
             let can_write = BLOCK_SIZE - o; // bytes we can place in this page
             let n = remaining.len().min(can_write);
+
+            // Enforce the exclusive physical write limit before any RF write.
+            if addr as usize + n > limit_addr as usize {
+                return Err(Type2Error::OutOfRange.into());
+            }
 
             if o == 0 && n == BLOCK_SIZE {
                 // Full page — write directly, no read needed.
@@ -479,7 +517,19 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
 
     /// Write a single byte at a given byte address, doing a read-modify-write
     /// on the containing block.
-    fn write_byte_at(&mut self, byte_addr: u16, value: u8) -> Result<(), ReaderError<T::Error>> {
+    ///
+    /// `limit_addr` is an exclusive physical bound: writing at or beyond it
+    /// returns [`Type2Error::OutOfRange`] before any RF write.
+    fn write_byte_at(
+        &mut self,
+        byte_addr: u16,
+        value: u8,
+        limit_addr: u16,
+    ) -> Result<(), ReaderError<T::Error>> {
+        if byte_addr >= limit_addr {
+            return Err(Type2Error::OutOfRange.into());
+        }
+
         let (sector, block, offset) = MemoryLayout::address_to_sector_block(byte_addr);
 
         if sector != self.current_sector {
@@ -862,5 +912,238 @@ mod tests {
         reader.set_max_retries(0);
 
         assert!(reader.read(3).is_err());
+    }
+
+    // ── write_ndef bounds enforcement (SFT-7601) ───────────────────
+
+    /// Transceiver that applies writes to flat memory and counts every
+    /// WRITE command, so tests can assert that no page write escaped the
+    /// data area (or that no write happened at all).
+    struct RecordingTransceiver {
+        memory: [u8; 1024],
+        writes: usize,
+    }
+
+    impl RecordingTransceiver {
+        fn new() -> Self {
+            RecordingTransceiver {
+                memory: [0u8; 1024],
+                writes: 0,
+            }
+        }
+
+        /// Write a valid CC (`size_field` * 8 bytes of data area) plus an
+        /// empty NDEF Message TLV and Terminator at the data-area start.
+        fn setup(&mut self, size_field: u8) {
+            self.memory[12] = 0xE1; // magic
+            self.memory[13] = 0x10; // version 1.0
+            self.memory[14] = size_field; // data area = size_field * 8
+            self.memory[15] = 0x00; // r/w access
+            self.memory[16] = 0x03; // NDEF Message TLV
+            self.memory[17] = 0x00; // L = 0
+            self.memory[18] = 0xFE; // Terminator
+        }
+    }
+
+    impl T2TTransceiver for RecordingTransceiver {
+        type Error = ();
+
+        fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec, ()> {
+            let command = Command::try_from(cmd).map_err(|_| ())?;
+            match command {
+                Command::Read { block_no } => {
+                    let start = block_no as usize * BLOCK_SIZE;
+                    let mut response = FrameVec::new();
+                    let end = (start + 16).min(self.memory.len());
+                    let _ = response.try_extend(&self.memory[start..end]);
+                    while response.len() < 16 {
+                        let _ = response.try_push(0);
+                    }
+                    Ok(response)
+                }
+                Command::Write { block_no, data } => {
+                    self.writes += 1;
+                    let start = block_no as usize * BLOCK_SIZE;
+                    if start + 4 <= self.memory.len() {
+                        self.memory[start..start + 4].copy_from_slice(&data);
+                    }
+                    let mut response = FrameVec::new();
+                    let _ = response.try_push(ACK);
+                    Ok(response)
+                }
+                Command::SectorSelectPart1 => {
+                    let mut response = FrameVec::new();
+                    let _ = response.try_push(ACK);
+                    Ok(response)
+                }
+                Command::SectorSelectPart2 { .. } => Err(()),
+            }
+        }
+
+        fn transceive_no_response(&mut self, _cmd: &[u8]) -> Result<Option<u8>, ()> {
+            Ok(None)
+        }
+    }
+
+    /// A 65,536-byte input truncates to length 0 under `as u16`. It must
+    /// now be rejected with a range error before any write — including the
+    /// `alloc`/`std` builds whose unbounded `DataVec` previously let the
+    /// full slice through and into the security pages.
+    #[test]
+    fn write_ndef_rejects_oversized_input_with_no_writes() {
+        let mut mock = RecordingTransceiver::new();
+        mock.setup(0x06); // 48-byte data area
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            let oversized = [0xAAu8; 65_536];
+            let res = reader.write_ndef(&oversized);
+            assert!(matches!(
+                res,
+                Err(ReaderError::Protocol(Type2Error::OutOfRange))
+            ));
+        }
+        assert_eq!(mock.writes, 0, "oversized input must not write any page");
+    }
+
+    /// Any length that cannot be encoded in the TLV length field (> 0xFFFE)
+    /// is rejected before writing.
+    #[test]
+    fn write_ndef_rejects_unencodable_length_with_no_writes() {
+        let mut mock = RecordingTransceiver::new();
+        mock.setup(0x06);
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            let too_long = [0u8; 0xFFFF]; // 0xFFFF is the reserved marker value
+            let res = reader.write_ndef(&too_long);
+            assert!(matches!(
+                res,
+                Err(ReaderError::Protocol(Type2Error::OutOfRange))
+            ));
+        }
+        assert_eq!(mock.writes, 0);
+    }
+
+    /// A payload that fits `data_area_size` from offset 0 but overruns once
+    /// a preceding NULL TLV shifts the write start must be rejected with no
+    /// writes — the near-capacity overrun variant.
+    #[test]
+    fn write_ndef_rejects_nonzero_offset_overrun_with_no_writes() {
+        let mut mock = RecordingTransceiver::new();
+        // 48-byte data area, NULL TLV then empty NDEF TLV → NDEF at offset 1.
+        mock.memory[12..16].copy_from_slice(&[0xE1, 0x10, 0x06, 0x00]);
+        mock.memory[16] = 0x00; // NULL TLV consumes one offset byte
+        mock.memory[17] = 0x03; // NDEF Message TLV
+        mock.memory[18] = 0x00; // L = 0
+        mock.memory[19] = 0xFE; // Terminator
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            // 45 bytes: 1+1+45+1 = 48 fits at offset 0, but +1 offset = 49 > 48.
+            let payload = [0xABu8; 45];
+            let res = reader.write_ndef(&payload);
+            assert!(matches!(
+                res,
+                Err(ReaderError::Protocol(Type2Error::OutOfRange))
+            ));
+        }
+        assert_eq!(mock.writes, 0, "offset overrun must not write any page");
+    }
+
+    /// A Memory Control TLV (reserved region) ahead of the NDEF TLV pushes
+    /// the write offset to 5. A payload that would fit from offset 0 but
+    /// overruns once that offset is included must be rejected with no writes.
+    #[test]
+    fn write_ndef_rejects_memory_control_offset_overrun_with_no_writes() {
+        let mut mock = RecordingTransceiver::new();
+        // 48-byte data area. Memory Control TLV (T,L,V=3) then empty NDEF TLV
+        // → NDEF at offset 5.
+        mock.memory[12..16].copy_from_slice(&[0xE1, 0x10, 0x06, 0x00]);
+        mock.memory[16] = 0x02; // Memory Control TLV
+        mock.memory[17] = 0x03; // L = 3
+        mock.memory[18] = 0xF0; // V: page_addr=15, byte_offset=0
+        mock.memory[19] = 0x05; // V: size
+        mock.memory[20] = 0x03; // V: bytes-per-page
+        mock.memory[21] = 0x03; // NDEF Message TLV
+        mock.memory[22] = 0x00; // L = 0
+        mock.memory[23] = 0xFE; // Terminator
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            // 41 bytes: 1+1+41+1 = 44 fits at offset 0, but +5 offset = 49 > 48.
+            let payload = [0xCDu8; 41];
+            let res = reader.write_ndef(&payload);
+            assert!(matches!(
+                res,
+                Err(ReaderError::Protocol(Type2Error::OutOfRange))
+            ));
+        }
+        assert_eq!(
+            mock.writes, 0,
+            "reserved-region offset overrun must not write"
+        );
+    }
+
+    /// The maximum payload that exactly fills the data area succeeds and
+    /// writes nothing beyond it (which on NTAG is the dynamic-lock page).
+    #[test]
+    fn write_ndef_max_payload_stays_within_data_area() {
+        let mut mock = RecordingTransceiver::new();
+        mock.setup(0x06); // 48-byte data area at bytes 16..64
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            // 45 bytes: T + L + 45 + Terminator = 48 = data area.
+            reader.write_ndef(&[0x55u8; 45]).unwrap();
+        }
+        assert_eq!(mock.memory[16], 0x03); // T
+        assert_eq!(mock.memory[17], 45); // L (final)
+        assert_eq!(mock.memory[63], 0xFE); // Terminator at last data-area byte
+        assert!(
+            mock.memory[64..].iter().all(|&b| b == 0),
+            "nothing written beyond the data area"
+        );
+    }
+
+    /// A 255-byte payload uses the 3-byte extended length encoding and, when
+    /// it fits, is written correctly.
+    #[test]
+    fn write_ndef_extended_length_encoding() {
+        let mut mock = RecordingTransceiver::new();
+        mock.setup(0x40); // 512-byte data area
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            reader.write_ndef(&[0x22u8; 255]).unwrap();
+        }
+        assert_eq!(mock.memory[16], 0x03); // T
+        assert_eq!(mock.memory[17], 0xFF); // 3-byte length marker
+        assert_eq!(mock.memory[18], 0x00); // length MSB
+        assert_eq!(mock.memory[19], 0xFF); // length LSB (255)
+        assert_eq!(mock.memory[20], 0x22); // V starts
+        assert_eq!(mock.memory[275], 0xFE); // Terminator after 255 bytes
+    }
+
+    /// Length-format boundary: a 253-byte payload (1-byte length) exactly
+    /// fills a 256-byte data area and succeeds, while a 255-byte payload
+    /// (3-byte length, needs 260) is rejected with no writes.
+    #[test]
+    fn write_ndef_length_boundary() {
+        // Just fits with 1-byte length.
+        let mut fit = RecordingTransceiver::new();
+        fit.setup(0x20); // 256-byte data area
+        {
+            let mut reader = T2TReader::new(&mut fit);
+            reader.write_ndef(&[0x33u8; 253]).unwrap();
+        }
+        assert_eq!(fit.memory[17], 253); // 1-byte length field
+
+        // Just over with 3-byte length.
+        let mut over = RecordingTransceiver::new();
+        over.setup(0x20);
+        {
+            let mut reader = T2TReader::new(&mut over);
+            let res = reader.write_ndef(&[0x33u8; 255]); // needs 260 > 256
+            assert!(matches!(
+                res,
+                Err(ReaderError::Protocol(Type2Error::OutOfRange))
+            ));
+        }
+        assert_eq!(over.writes, 0);
     }
 }
