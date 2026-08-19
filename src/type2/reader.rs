@@ -31,6 +31,22 @@ impl<E> From<Type2Error> for ReaderError<E> {
 /// Default number of retries on transient transceiver errors.
 const DEFAULT_MAX_RETRIES: u8 = 1;
 
+/// Tracked sector-selection state.
+///
+/// Block numbers are sector-relative, so the reader must never assume which
+/// sector is active after an ambiguous failure. A Type 2 protocol infringement
+/// resets the tag to sector 0, and a transceiver error cannot distinguish
+/// "not transmitted" from "applied, but the response was lost" — either way the
+/// cached sector may no longer match the tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectorState {
+    /// The tag is known to have this sector selected.
+    Known(u8),
+    /// The active sector is unknown; it must be re-established before any
+    /// sector-relative command.
+    Unknown,
+}
+
 /// High-level NFC Forum Type 2 Tag reader/writer.
 ///
 /// Wraps a [`T2TTransceiver`] and tracks the currently selected sector.
@@ -38,7 +54,7 @@ const DEFAULT_MAX_RETRIES: u8 = 1;
 /// Retries transient transceiver errors up to `max_retries` times.
 pub struct T2TReader<'t, T: T2TTransceiver<N>, const N: usize> {
     transceiver: &'t mut T,
-    current_sector: u8,
+    sector: SectorState,
     /// Cached 16-byte READ result: (block_no, data).
     cache_block: Option<u8>,
     cache_data: [u8; 16],
@@ -51,7 +67,7 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
     pub fn new(transceiver: &'t mut T) -> Self {
         T2TReader {
             transceiver,
-            current_sector: 0,
+            sector: SectorState::Known(0),
             cache_block: None,
             cache_data: [0u8; 16],
             max_retries: DEFAULT_MAX_RETRIES,
@@ -68,8 +84,18 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
     }
 
     /// Get the currently selected sector number.
-    pub fn current_sector(&self) -> u8 {
-        self.current_sector
+    /// Returns `None` when the active sector is unknown after an ambiguous
+    /// error; the next sector-relative operation re-establishes it.
+    pub fn current_sector(&self) -> Option<u8> {
+        match self.sector {
+            SectorState::Known(s) => Some(s),
+            SectorState::Unknown => None,
+        }
+    }
+
+    /// Current sector-selection state, including whether it is unknown.
+    pub fn sector_state(&self) -> SectorState {
+        self.sector
     }
 
     /// Get a mutable reference to the underlying transceiver.
@@ -93,15 +119,36 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
     /// Retries up to `max_retries` times on transceiver-level errors.
     /// Useful for sending custom commands with the same retry behavior
     /// as the built-in READ/WRITE.
+    /// A transceiver error makes the active sector ambiguous, so every retry
+    /// first re-establishes the sector that was intended when the command was
+    /// issued. Without that, a failure which reset the tag to sector 0 would
+    /// silently redirect the retry to the same block number in the wrong
+    /// sector. If the sector was already unknown, no retry is attempted.
     pub fn transceive_with_retry(
         &mut self,
         cmd: &[u8],
     ) -> Result<crate::vec::FrameVec<N>, ReaderError<T::Error>> {
+        let intended = self.sector;
         let mut last_err = None;
-        for _ in 0..=self.max_retries {
+        for attempt in 0..=self.max_retries {
+            if attempt > 0 {
+                match intended {
+                    // Re-select before retrying so the retry provably lands in
+                    // the intended sector.
+                    SectorState::Known(s) => self.force_sector_select(s)?,
+                    // Sector unknown before the command: retrying could hit any
+                    // sector, so stop and report the original error.
+                    SectorState::Unknown => break,
+                }
+            }
             match self.transceiver.transceive(cmd) {
                 Ok(raw) => return Ok(raw),
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    // Ambiguous failure: the tag may have reset to sector 0.
+                    self.sector = SectorState::Unknown;
+                    self.invalidate_cache();
+                    last_err = Some(e);
+                }
             }
         }
         Err(ReaderError::Transceiver(last_err.unwrap()))
@@ -158,21 +205,42 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
         if sector > MAX_SECTOR {
             return Err(Type2Error::OutOfRange.into());
         }
-        if sector == self.current_sector {
+        if self.sector == SectorState::Known(sector) {
             return Ok(());
         }
-        self.invalidate_cache();
+        self.force_sector_select(sector)
+    }
 
-        // Packet 1: [0xC2, 0xFF] — retries on transceiver error.
+    /// Perform the SECTOR SELECT sequence unconditionally, without the
+    /// known-state fast path.
+    ///
+    /// Any failure — transceiver error or NACK, in either packet — leaves the
+    /// sector state [`SectorState::Unknown`] and the read cache invalidated,
+    /// since the tag may or may not have applied the selection. Packet 1 is
+    /// sent directly rather than through [`Self::transceive_with_retry`] to
+    /// avoid recursing back into sector recovery.
+    fn force_sector_select(&mut self, sector: u8) -> Result<(), ReaderError<T::Error>> {
+        if sector > MAX_SECTOR {
+            return Err(Type2Error::OutOfRange.into());
+        }
+        self.invalidate_cache();
+        self.sector = SectorState::Unknown;
+
+        // Packet 1: [0xC2, 0xFF]
         let cmd1 = Command::SectorSelectPart1;
-        let raw = self.transceive_with_retry(&cmd1.to_bytes())?;
+        let raw = self
+            .transceiver
+            .transceive(&cmd1.to_bytes())
+            .map_err(ReaderError::Transceiver)?;
         match cmd1.parse_answer(&raw)? {
             Answer::Ack => {}
             Answer::Nack(code) => return Err(Type2Error::Nack(code).into()),
             _ => return Err(Type2Error::InvalidLength.into()),
         }
 
-        // Packet 2: [sector_no, 0x00, 0x00, 0x00]
+        // Packet 2: [sector_no, 0x00, 0x00, 0x00] — passive ACK (silence) on
+        // success. An error here is ambiguous: the tag may have applied the
+        // selection anyway, so the state stays Unknown.
         let cmd2 = Command::SectorSelectPart2 { sector_no: sector };
         let nack = self
             .transceiver
@@ -182,7 +250,7 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
             return Err(Type2Error::Nack(nack_code).into());
         }
 
-        self.current_sector = sector;
+        self.sector = SectorState::Known(sector);
         Ok(())
     }
 
@@ -226,7 +294,7 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
                 MemoryLayout::address_to_sector_block(byte_addr).ok_or(Type2Error::OutOfRange)?;
 
             // Switch sector if needed.
-            if sector != self.current_sector {
+            if self.sector != SectorState::Known(sector) {
                 self.sector_select(sector)?;
             }
 
@@ -511,7 +579,7 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
             }
             let (sector, block, offset) =
                 MemoryLayout::address_to_sector_block(addr).ok_or(Type2Error::OutOfRange)?;
-            if sector != self.current_sector {
+            if self.sector != SectorState::Known(sector) {
                 self.sector_select(sector)?;
             }
             let page_base = addr - offset as u32;
@@ -867,6 +935,8 @@ mod tests {
     struct FailingTransceiver {
         inner: MockTransceiver,
         failures_remaining: usize,
+        /// Number of `transceive` calls made (used to count retry attempts).
+        attempts: usize,
     }
 
     impl FailingTransceiver {
@@ -874,6 +944,7 @@ mod tests {
             FailingTransceiver {
                 inner: MockTransceiver::new(),
                 failures_remaining: fail_count,
+                attempts: 0,
             }
         }
     }
@@ -882,6 +953,7 @@ mod tests {
         type Error = ();
 
         fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec, ()> {
+            self.attempts += 1;
             if self.failures_remaining > 0 {
                 self.failures_remaining -= 1;
                 return Err(());
@@ -923,6 +995,201 @@ mod tests {
         reader.set_max_retries(0);
 
         assert!(reader.read(3).is_err());
+    }
+
+    // ── Sector state across retries (SFT-7595) ─────────────────────
+
+    /// Multi-sector mock that models the NFC Forum rule making sector 0 the
+    /// default after a protocol infringement: the configured failure returns an
+    /// error *and* resets the tag's active sector to 0. Records the physical
+    /// (sector, block) of every WRITE so a misdirected retry is detectable.
+    struct SectorResetTransceiver {
+        /// Sector the tag itself considers active.
+        tag_sector: u8,
+        /// Countdown to the next induced failure; 0 disables.
+        fail_in: usize,
+        /// Physical (sector, block, data) of each WRITE applied.
+        writes: heapless::Vec<(u8, u8, [u8; 4]), 8>,
+        /// Number of SECTOR SELECT sequences completed.
+        selects: usize,
+        /// When set, packet 2 returns a transceiver error.
+        fail_packet2: bool,
+    }
+
+    impl SectorResetTransceiver {
+        fn new() -> Self {
+            SectorResetTransceiver {
+                tag_sector: 0,
+                fail_in: 0,
+                writes: heapless::Vec::new(),
+                selects: 0,
+                fail_packet2: false,
+            }
+        }
+    }
+
+    impl T2TTransceiver for SectorResetTransceiver {
+        type Error = ();
+
+        fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec, ()> {
+            let command = Command::try_from(cmd).map_err(|_| ())?;
+            // Induce a failure that also resets the tag to sector 0, exactly as
+            // a protocol infringement would.
+            if self.fail_in > 0 {
+                self.fail_in -= 1;
+                if self.fail_in == 0 {
+                    self.tag_sector = 0;
+                    return Err(());
+                }
+            }
+            match command {
+                Command::Read { .. } => {
+                    let mut response = FrameVec::new();
+                    let _ = response.try_extend(&[0u8; 16]);
+                    Ok(response)
+                }
+                Command::Write { block_no, data } => {
+                    let _ = self.writes.push((self.tag_sector, block_no, data));
+                    let mut response = FrameVec::new();
+                    let _ = response.try_push(ACK);
+                    Ok(response)
+                }
+                Command::SectorSelectPart1 => {
+                    let mut response = FrameVec::new();
+                    let _ = response.try_push(ACK);
+                    Ok(response)
+                }
+                Command::SectorSelectPart2 { .. } => Err(()),
+            }
+        }
+
+        fn transceive_no_response(&mut self, cmd: &[u8]) -> Result<Option<u8>, ()> {
+            if self.fail_packet2 {
+                return Err(());
+            }
+            // Packet 2 carries the sector number.
+            self.tag_sector = cmd[0];
+            self.selects += 1;
+            Ok(None)
+        }
+    }
+
+    /// A transceiver error that resets the tag to sector 0 must not let the
+    /// retry land on sector 0's copy of the same block: the reader re-selects
+    /// sector 1 first.
+    #[test]
+    fn retry_after_sector_reset_reselects_intended_sector() {
+        let mut mock = SectorResetTransceiver::new();
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            reader.set_max_retries(1);
+            reader.sector_select(1).unwrap();
+            // Fail the next transceive (the WRITE), resetting the tag to 0.
+            reader.transceiver().fail_in = 1;
+            reader.write(3, [0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+            assert_eq!(reader.current_sector(), Some(1));
+        }
+        // Exactly one write landed, and it landed in sector 1 — never sector 0,
+        // where block 3 is the Capability Container.
+        assert_eq!(mock.writes.len(), 1);
+        assert_eq!(mock.writes[0].0, 1, "write must land in sector 1");
+        assert_eq!(mock.writes[0].1, 3);
+        // Two selects: the initial one plus the recovery before the retry.
+        assert_eq!(mock.selects, 2);
+    }
+
+    /// A packet-2 failure leaves the sector unknown, and the next operation
+    /// re-establishes it rather than assuming the old value.
+    #[test]
+    fn packet2_error_leaves_sector_unknown() {
+        let mut mock = SectorResetTransceiver::new();
+        let mut reader = T2TReader::new(&mut mock);
+        reader.sector_select(1).unwrap();
+        assert_eq!(reader.sector_state(), SectorState::Known(1));
+
+        reader.transceiver().fail_packet2 = true;
+        assert!(reader.sector_select(2).is_err());
+        assert_eq!(reader.sector_state(), SectorState::Unknown);
+        assert_eq!(reader.current_sector(), None);
+
+        // Recovery: a later successful selection restores a known sector.
+        reader.transceiver().fail_packet2 = false;
+        reader.sector_select(2).unwrap();
+        assert_eq!(reader.sector_state(), SectorState::Known(2));
+    }
+
+    /// A NACK from packet 2 is equally ambiguous and must leave state unknown.
+    #[test]
+    fn packet2_nack_leaves_sector_unknown() {
+        struct NackP2(SectorResetTransceiver);
+        impl T2TTransceiver for NackP2 {
+            type Error = ();
+            fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec, ()> {
+                self.0.transceive(cmd)
+            }
+            fn transceive_no_response(&mut self, _cmd: &[u8]) -> Result<Option<u8>, ()> {
+                Ok(Some(0x00)) // NACK
+            }
+        }
+        let mut mock = NackP2(SectorResetTransceiver::new());
+        let mut reader = T2TReader::new(&mut mock);
+        assert!(reader.sector_select(1).is_err());
+        assert_eq!(reader.sector_state(), SectorState::Unknown);
+    }
+
+    /// An error leaves the sector unknown and invalidates the read cache, so a
+    /// later read cannot be served with data from a possibly-different sector.
+    #[test]
+    fn ambiguous_error_invalidates_cache_and_sector() {
+        let mut mock = FailingTransceiver::new(0);
+        mock.inner.setup_static_with_ndef();
+        let mut reader = T2TReader::new(&mut mock);
+        reader.set_max_retries(0);
+
+        let _ = reader.read(3).unwrap(); // populates the cache
+        reader.transceiver().failures_remaining = 1;
+        assert!(reader.read(8).is_err());
+
+        assert_eq!(reader.sector_state(), SectorState::Unknown);
+        assert!(reader.cache_block.is_none(), "cache must be invalidated");
+    }
+
+    /// With the sector already unknown, a failing command is not retried into
+    /// an arbitrary sector.
+    #[test]
+    fn no_retry_while_sector_unknown() {
+        let mut mock = FailingTransceiver::new(0);
+        mock.inner.setup_static_with_ndef();
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            reader.set_max_retries(3);
+            // Drive the reader into the unknown state: every attempt fails, so
+            // even the sector-recovery step cannot restore a known sector.
+            reader.transceiver().failures_remaining = 100;
+            assert!(reader.read(3).is_err());
+            assert_eq!(reader.sector_state(), SectorState::Unknown);
+
+            // A second failure must not spawn retries while unknown.
+            reader.transceiver().attempts = 0;
+            assert!(reader.read(3).is_err());
+            assert_eq!(
+                reader.transceiver().attempts,
+                1,
+                "no retry may be attempted while the sector is unknown"
+            );
+        }
+    }
+
+    /// Sector 0xFF is reserved and must be rejected without any RF traffic.
+    #[test]
+    fn reserved_sector_rejected() {
+        let mut mock = SectorResetTransceiver::new();
+        let mut reader = T2TReader::new(&mut mock);
+        assert!(matches!(
+            reader.sector_select(0xFF),
+            Err(ReaderError::Protocol(Type2Error::OutOfRange))
+        ));
+        assert_eq!(reader.transceiver().selects, 0);
     }
 
     // ── write_ndef bounds enforcement (SFT-7601) ───────────────────
