@@ -202,6 +202,32 @@ impl MemoryLayout {
     pub fn sector_block_to_address(sector: u8, block: u8, offset: u8) -> u16 {
         sector as u16 * SECTOR_SIZE as u16 + block as u16 * BLOCK_SIZE as u16 + offset as u16
     }
+
+    /// Physical byte address of the `n`-th usable byte of the data area,
+    /// counting from the data-area start and skipping every lock and reserved
+    /// (Memory Control) region. `n == 0` yields the first usable byte.
+    ///
+    /// This is the inverse of the filtering done by
+    /// [`read_data_area`](super::reader::T2TReader::read_data_area): logical
+    /// offsets into the skip-filtered data stream map back to true physical
+    /// addresses, so the writer can locate the NDEF TLV and step over
+    /// lock/reserved bytes instead of overwriting them.
+    ///
+    /// Returns `None` if the walk runs past addressable (`u16`) memory, which
+    /// can only happen for a malformed layout whose skip regions never end.
+    pub fn usable_offset_to_address(&self, n: u16) -> Option<u16> {
+        let mut addr = DATA_START_BLOCK as u16 * BLOCK_SIZE as u16;
+        let mut remaining = n;
+        loop {
+            if !self.is_skip_area(addr) {
+                if remaining == 0 {
+                    return Some(addr);
+                }
+                remaining -= 1;
+            }
+            addr = addr.checked_add(1)?;
+        }
+    }
 }
 
 /// Default dynamic lock area when no Lock Control TLV is present (Section 2.2.2).
@@ -289,6 +315,40 @@ mod tests {
             MemoryLayout::sector_block_to_address(sector, block, offset),
             addr
         );
+    }
+
+    #[test]
+    fn usable_offset_maps_over_skip_areas() {
+        // 96-byte data area with the default dynamic lock area at 112.
+        let cc = CapabilityContainer::try_from([0xE1, 0x10, 0x0C, 0x00]).unwrap();
+        let layout = MemoryLayout::from_cc_and_tlvs(&cc, &[]);
+        assert_eq!(layout.lock_areas[0].byte_address, 112);
+
+        // Offsets before the lock area map 1:1 from the data area start (16).
+        assert_eq!(layout.usable_offset_to_address(0), Some(16));
+        assert_eq!(layout.usable_offset_to_address(95), Some(111));
+        // The lock byte at 112 is skipped: the next usable byte is 113.
+        assert_eq!(layout.usable_offset_to_address(96), Some(113));
+    }
+
+    #[test]
+    fn usable_offset_skips_reserved_area_before_ndef() {
+        // Reserved area covering 20..24 sits inside the data area, so logical
+        // offsets past it map to physical addresses shifted by its size.
+        let cc = CapabilityContainer::try_from([0xE1, 0x10, 0x06, 0x00]).unwrap();
+        let mc = MemoryControlValue {
+            page_addr: 0x05,
+            byte_offset: 0x00,
+            size_in_bytes: 4,
+            bytes_per_page: 2, // page size 4 → address 20
+        };
+        let layout = MemoryLayout::from_cc_and_tlvs(&cc, &[Tlv::MemoryControl(mc)]);
+        assert_eq!(layout.reserved_areas[0].byte_address, 20);
+
+        assert_eq!(layout.usable_offset_to_address(0), Some(16));
+        assert_eq!(layout.usable_offset_to_address(3), Some(19));
+        // 20..24 reserved → logical 4 lands at 24, not 20.
+        assert_eq!(layout.usable_offset_to_address(4), Some(24));
     }
 
     #[test]

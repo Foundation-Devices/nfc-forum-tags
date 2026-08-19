@@ -402,32 +402,44 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
 
         let ndef_offset = ndef_tlv_offset.ok_or(Type2Error::InvalidTlv)?;
 
-        // Prove the entire physical write plan stays within the CC data
-        // area before touching the tag. The span runs from the data-area
-        // start, past any preceding TLVs (`ndef_offset`), through
-        // T + L + V + Terminator. Using checked `usize` arithmetic and
-        // including `ndef_offset` closes both the wrapping overflow and the
-        // near-capacity overrun where a non-zero offset pushed the write
-        // past the end of the data area.
+        // Prove the encoded TLV fits the usable capacity remaining after the
+        // mandatory NDEF TLV. The data area counts only usable (non-skip)
+        // bytes, so `data_area_size - ndef_offset` is the exact room left for
+        // T + L + V + Terminator. Checked `usize` arithmetic with the offset
+        // included rejects the oversized/near-capacity overruns before any
+        // WRITE is issued.
         let required_end = ndef_offset
             .checked_add(1) // T
             .and_then(|x| x.checked_add(l_field_size)) // L
             .and_then(|x| x.checked_add(ndef_len_usize)) // V
             .and_then(|x| x.checked_add(1)) // Terminator
             .ok_or(Type2Error::OutOfRange)?;
-        if required_end > cc.data_area_size() as usize {
+        let data_area_size = cc.data_area_size();
+        if required_end > data_area_size as usize {
             return Err(Type2Error::OutOfRange.into());
         }
 
-        let data_start_addr = DATA_START_BLOCK as u16 * BLOCK_SIZE as u16;
-        let ndef_byte_addr = data_start_addr + ndef_offset as u16;
+        // Build the memory layout so the write can locate the NDEF TLV at its
+        // true physical address and step over lock/reserved regions. The data
+        // area's usable bytes are not contiguous: control regions before the
+        // NDEF TLV shift its physical address above `data_start + ndef_offset`,
+        // and any region within the value must be preserved, not overwritten.
+        let layout = MemoryLayout::from_cc_and_tlvs(&cc, &tlvs);
 
-        // Exclusive physical write limit: no page write may touch this
-        // address or beyond. This is the byte just past the CC data area,
-        // which on NTAG sits exactly at the dynamic-lock page — keeping
-        // writes off the lock, configuration, PWD, and PACK pages even if
-        // the checks above were ever wrong. Defense in depth.
-        let write_limit_addr = data_start_addr + cc.data_area_size();
+        // Physical address of the NDEF TLV: the logical offset mapped through
+        // the skip regions. Never `data_start + ndef_offset` directly, which
+        // is only correct when nothing is skipped before the NDEF TLV.
+        let ndef_byte_addr = layout
+            .usable_offset_to_address(ndef_offset as u16)
+            .ok_or(Type2Error::OutOfRange)?;
+
+        // Exclusive physical limit: one byte past the last usable byte of the
+        // data area. Every legitimate write lands strictly below it, so it is
+        // a defense-in-depth backstop against a runaway cursor.
+        let write_limit_addr = layout
+            .usable_offset_to_address(data_area_size - 1)
+            .and_then(|a| a.checked_add(1))
+            .ok_or(Type2Error::OutOfRange)?;
 
         // Build the full byte sequence to write:
         // [T=0x03, L=0x00, ...ndef_data..., T=0xFE]
@@ -449,102 +461,95 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
             .try_push(tlv::TLV_TERMINATOR)
             .map_err(Type2Error::from)?;
 
-        // Write the payload page by page using read-modify-write for
-        // pages that are partially covered.
-        self.write_bytes_at(ndef_byte_addr, &payload, write_limit_addr)?;
+        // Write the payload over usable bytes only, jumping lock/reserved
+        // regions so they are never modified.
+        self.write_usable_bytes(&layout, ndef_byte_addr, &payload, write_limit_addr)?;
 
-        // Update L field with actual length (atomic-ish: single page write).
+        // Crash-safe length update: set the real L field last, again through
+        // the skip-aware path. The L field is at logical offset ndef_offset+1.
+        let l_addr = layout
+            .usable_offset_to_address(ndef_offset as u16 + 1)
+            .ok_or(Type2Error::OutOfRange)?;
         if ndef_len < 0xFF {
-            self.write_byte_at(ndef_byte_addr + 1, ndef_len as u8, write_limit_addr)?;
+            self.write_usable_bytes(&layout, l_addr, &[ndef_len as u8], write_limit_addr)?;
         } else {
             // 3-byte length: [0xFF, MSB, LSB] at bytes 1..4 from T.
             let l_bytes = [0xFF, (ndef_len >> 8) as u8, ndef_len as u8];
-            self.write_bytes_at(ndef_byte_addr + 1, &l_bytes, write_limit_addr)?;
+            self.write_usable_bytes(&layout, l_addr, &l_bytes, write_limit_addr)?;
         }
 
         Ok(())
     }
 
-    /// Write a contiguous byte sequence starting at `start_addr`, using
-    /// page-level writes. Partial pages at the start and end are handled
-    /// via read-modify-write; full pages are written directly.
+    /// Write `data` across the usable (non-skip) bytes of the data area,
+    /// starting at physical `start_addr` and jumping over lock and reserved
+    /// regions described by `layout` so they are preserved.
     ///
-    /// `limit_addr` is an exclusive physical bound: any page write that
-    /// would touch `limit_addr` or beyond returns [`Type2Error::OutOfRange`]
-    /// before the write is issued. This is defense in depth against writes
-    /// escaping the CC data area into lock/configuration pages.
-    fn write_bytes_at(
+    /// Skip bytes that fall inside a written page are kept via
+    /// read-modify-write; a fully usable, fully covered page is written
+    /// directly. `limit_addr` is an exclusive physical bound — reaching it
+    /// before `data` is consumed returns [`Type2Error::OutOfRange`], so a
+    /// malformed layout cannot drive writes out of the data area.
+    fn write_usable_bytes(
         &mut self,
+        layout: &MemoryLayout,
         start_addr: u16,
         data: &[u8],
         limit_addr: u16,
     ) -> Result<(), ReaderError<T::Error>> {
+        let mut di = 0usize;
         let mut addr = start_addr;
-        let mut remaining = data;
 
-        while !remaining.is_empty() {
+        while di < data.len() {
+            if addr >= limit_addr {
+                return Err(Type2Error::OutOfRange.into());
+            }
             let (sector, block, offset) = MemoryLayout::address_to_sector_block(addr);
             if sector != self.current_sector {
                 self.sector_select(sector)?;
             }
+            let page_base = addr - offset as u16;
 
-            let o = offset as usize;
-            let can_write = BLOCK_SIZE - o; // bytes we can place in this page
-            let n = remaining.len().min(can_write);
-
-            // Enforce the exclusive physical write limit before any RF write.
-            if addr as usize + n > limit_addr as usize {
-                return Err(Type2Error::OutOfRange.into());
+            // Fast path: a fully usable page that remaining data fully covers
+            // needs no read-modify-write.
+            let page_all_usable =
+                (0..BLOCK_SIZE).all(|i| !layout.is_skip_area(page_base + i as u16));
+            if offset == 0 && data.len() - di >= BLOCK_SIZE && page_all_usable {
+                if page_base as usize + BLOCK_SIZE > limit_addr as usize {
+                    return Err(Type2Error::OutOfRange.into());
+                }
+                let page = [data[di], data[di + 1], data[di + 2], data[di + 3]];
+                self.write(block, page)?;
+                di += BLOCK_SIZE;
+                addr = page_base + BLOCK_SIZE as u16;
+                continue;
             }
 
-            if o == 0 && n == BLOCK_SIZE {
-                // Full page — write directly, no read needed.
-                let page = [remaining[0], remaining[1], remaining[2], remaining[3]];
-                self.write(block, page)?;
-            } else {
-                // Partial page — read-modify-write.
-                let cur = self.read(block)?;
-                let mut page = [cur[0], cur[1], cur[2], cur[3]];
-                page[o..o + n].copy_from_slice(&remaining[..n]);
+            // Slow path: read-modify-write, placing data only on usable bytes
+            // and preserving any lock/reserved byte in the page.
+            let cur = self.read(block)?;
+            let mut page = [cur[0], cur[1], cur[2], cur[3]];
+            let mut touched = false;
+            for (i, slot) in page.iter_mut().enumerate().skip(offset as usize) {
+                if di >= data.len() {
+                    break;
+                }
+                let a = page_base + i as u16;
+                if a >= limit_addr {
+                    return Err(Type2Error::OutOfRange.into());
+                }
+                if layout.is_skip_area(a) {
+                    continue; // preserve lock/reserved byte
+                }
+                *slot = data[di];
+                di += 1;
+                touched = true;
+            }
+            if touched {
                 self.write(block, page)?;
             }
-
-            remaining = &remaining[n..];
-            addr += n as u16;
+            addr = page_base + BLOCK_SIZE as u16;
         }
-        Ok(())
-    }
-
-    /// Write a single byte at a given byte address, doing a read-modify-write
-    /// on the containing block.
-    ///
-    /// `limit_addr` is an exclusive physical bound: writing at or beyond it
-    /// returns [`Type2Error::OutOfRange`] before any RF write.
-    fn write_byte_at(
-        &mut self,
-        byte_addr: u16,
-        value: u8,
-        limit_addr: u16,
-    ) -> Result<(), ReaderError<T::Error>> {
-        if byte_addr >= limit_addr {
-            return Err(Type2Error::OutOfRange.into());
-        }
-
-        let (sector, block, offset) = MemoryLayout::address_to_sector_block(byte_addr);
-
-        if sector != self.current_sector {
-            self.sector_select(sector)?;
-        }
-
-        // Read the current block contents.
-        let read_data = self.read(block)?;
-        let mut block_data = [read_data[0], read_data[1], read_data[2], read_data[3]];
-
-        // Modify the target byte.
-        block_data[offset as usize] = value;
-
-        // Write back.
-        self.write(block, block_data)?;
         Ok(())
     }
 }
@@ -1117,6 +1122,150 @@ mod tests {
         assert_eq!(mock.memory[19], 0xFF); // length LSB (255)
         assert_eq!(mock.memory[20], 0x22); // V starts
         assert_eq!(mock.memory[275], 0xFE); // Terminator after 255 bytes
+    }
+
+    // ── Skip-region-aware writes (SFT-7594) ────────────────────────
+
+    /// Set up the audit-proof layout: a 96-byte data area (default dynamic
+    /// lock byte at physical 112) with a Proprietary TLV occupying 88 logical
+    /// bytes, so the NDEF TLV begins at physical address 104. A sentinel is
+    /// placed in the lock byte.
+    fn setup_proprietary_before_ndef(mock: &mut RecordingTransceiver) {
+        mock.memory[12..16].copy_from_slice(&[0xE1, 0x10, 0x0C, 0x00]); // 96 bytes
+        mock.memory[16] = 0xFD; // Proprietary TLV
+        mock.memory[17] = 86; // L = 86 → T+L+V = 88 logical bytes
+        mock.memory[104] = 0x03; // NDEF Message TLV at logical offset 88
+        mock.memory[105] = 0x00; // L = 0
+        mock.memory[106] = 0xFE; // Terminator
+        mock.memory[112] = 0xA5; // dynamic lock byte sentinel
+    }
+
+    /// The audit proof: a 10-byte message encodes to 13 bytes but only 8
+    /// usable bytes remain after the mandatory NDEF TLV. It previously wrote
+    /// 104..=116 contiguously and changed the lock byte at 112 from 0xA5 to
+    /// 0x07 while returning success. It must now return `OutOfRange` with no
+    /// WRITE issued and the lock byte intact.
+    #[test]
+    fn write_ndef_audit_proof_rejected_lock_byte_intact() {
+        let mut mock = RecordingTransceiver::new();
+        setup_proprietary_before_ndef(&mut mock);
+
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            let res = reader.write_ndef(&[0x11u8; 10]);
+            assert!(matches!(
+                res,
+                Err(ReaderError::Protocol(Type2Error::OutOfRange))
+            ));
+        }
+        assert_eq!(mock.writes, 0, "no WRITE may be issued");
+        assert_eq!(mock.memory[112], 0xA5, "lock byte must be untouched");
+    }
+
+    /// One byte beyond the remaining usable capacity performs zero writes.
+    #[test]
+    fn write_ndef_one_byte_excess_after_proprietary_tlv_no_writes() {
+        let mut mock = RecordingTransceiver::new();
+        setup_proprietary_before_ndef(&mut mock);
+
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            // 8 usable bytes remain: T + L + V + Terminator → V max = 5.
+            let res = reader.write_ndef(&[0x22u8; 6]);
+            assert!(matches!(
+                res,
+                Err(ReaderError::Protocol(Type2Error::OutOfRange))
+            ));
+        }
+        assert_eq!(mock.writes, 0, "one-byte excess must not write");
+        assert_eq!(mock.memory[112], 0xA5);
+    }
+
+    /// The exact-boundary message for the same layout succeeds, landing the
+    /// Terminator on the last usable byte without touching the lock byte.
+    #[test]
+    fn write_ndef_exact_boundary_after_proprietary_tlv_succeeds() {
+        let mut mock = RecordingTransceiver::new();
+        setup_proprietary_before_ndef(&mut mock);
+
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            reader.write_ndef(&[0x33u8; 5]).unwrap();
+        }
+        assert_eq!(mock.memory[104], 0x03); // T at the located physical address
+        assert_eq!(mock.memory[105], 5); // L updated last
+        assert!(mock.memory[106..111].iter().all(|&b| b == 0x33)); // V
+        assert_eq!(mock.memory[111], 0xFE); // Terminator on last usable byte
+        assert_eq!(mock.memory[112], 0xA5, "lock byte preserved at boundary");
+    }
+
+    /// A lock region (from a Lock Control TLV) that falls inside the NDEF
+    /// value is preserved, and the value continues past it.
+    #[test]
+    fn write_ndef_preserves_lock_region_inside_value() {
+        let mut mock = RecordingTransceiver::new();
+        // 96-byte data area with a Lock Control TLV placing 1 lock byte at
+        // physical address 28 (page_addr 7 * page size 4 + offset 0).
+        mock.memory[12..16].copy_from_slice(&[0xE1, 0x10, 0x0C, 0x00]);
+        mock.memory[16] = 0x01; // Lock Control TLV
+        mock.memory[17] = 0x03; // L = 3
+        mock.memory[18] = 0x70; // page_addr=7, byte_offset=0
+        mock.memory[19] = 0x08; // size_in_bits = 8 → 1 lock byte
+        mock.memory[20] = 0x32; // bytes_locked_per_bit=3, bytes_per_page=2
+        mock.memory[21] = 0x03; // NDEF Message TLV at logical offset 5
+        mock.memory[22] = 0x00; // L = 0
+        mock.memory[23] = 0xFE; // Terminator
+        mock.memory[28] = 0xA5; // lock byte sentinel
+
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            reader.write_ndef(&[0x44u8; 8]).unwrap();
+        }
+
+        assert_eq!(
+            mock.memory[28], 0xA5,
+            "lock region inside the value must be preserved"
+        );
+        assert_eq!(mock.memory[21], 0x03);
+        assert_eq!(mock.memory[22], 8);
+        // Value: 23..28, skip 28, resume 29..32.
+        assert!(mock.memory[23..28].iter().all(|&b| b == 0x44));
+        assert!(mock.memory[29..32].iter().all(|&b| b == 0x44));
+    }
+
+    /// A reserved (Memory Control) region inside the NDEF value is preserved,
+    /// and the value bytes continue on the far side of it.
+    #[test]
+    fn write_ndef_preserves_reserved_region_inside_value() {
+        let mut mock = RecordingTransceiver::new();
+        // 96-byte data area; Memory Control TLV reserving 24..28.
+        mock.memory[12..16].copy_from_slice(&[0xE1, 0x10, 0x0C, 0x00]);
+        mock.memory[16] = 0x02; // Memory Control TLV
+        mock.memory[17] = 0x03; // L = 3
+        mock.memory[18] = 0x60; // page_addr=6, byte_offset=0
+        mock.memory[19] = 0x04; // size = 4 bytes
+        mock.memory[20] = 0x02; // bytes_per_page exponent → page size 4 → addr 24
+        mock.memory[21] = 0x03; // NDEF Message TLV at logical offset 5
+        mock.memory[22] = 0x00; // L = 0
+        mock.memory[23] = 0xFE; // Terminator
+        // Sentinels in the reserved region.
+        mock.memory[24..28].copy_from_slice(&[0xA5, 0xA6, 0xA7, 0xA8]);
+
+        {
+            let mut reader = T2TReader::new(&mut mock);
+            reader.write_ndef(&[0x44u8; 8]).unwrap();
+        }
+
+        assert_eq!(
+            &mock.memory[24..28],
+            &[0xA5, 0xA6, 0xA7, 0xA8],
+            "reserved region inside the value must be preserved"
+        );
+        // TLV header at 21..23, value resumes after the reserved region.
+        assert_eq!(mock.memory[21], 0x03);
+        assert_eq!(mock.memory[22], 8);
+        assert_eq!(mock.memory[23], 0x44);
+        assert!(mock.memory[28..35].iter().all(|&b| b == 0x44));
     }
 
     /// Length-format boundary: a 253-byte payload (1-byte length) exactly
