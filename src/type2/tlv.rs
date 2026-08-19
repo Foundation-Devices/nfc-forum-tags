@@ -16,7 +16,7 @@
 //! | FEh | Terminator       | —       | —                    |
 
 use super::Type2Error;
-use crate::tlv::{self as shared_tlv, TlvError};
+use crate::tlv::{self as shared_tlv, MAX_TLV_LENGTH, TlvError};
 use crate::vec::{DataVec, VecExt};
 
 /// TLV tag field values.
@@ -341,13 +341,18 @@ impl Tlv {
                 out.try_extend(&v.to_bytes())?;
             }
             Tlv::NdefMessage(data) => {
+                // Validate the untruncated length *before* emitting anything,
+                // so an oversized value can never produce a TLV whose declared
+                // length disagrees with the bytes that follow it.
+                let len = checked_value_length(data.len())?;
                 out.try_push(TLV_NDEF_MESSAGE)?;
-                encode_tlv_length(data.len() as u16, &mut out)?;
+                encode_tlv_length(len, &mut out)?;
                 out.try_extend(data)?;
             }
             Tlv::Proprietary(data) => {
+                let len = checked_value_length(data.len())?;
                 out.try_push(TLV_PROPRIETARY)?;
-                encode_tlv_length(data.len() as u16, &mut out)?;
+                encode_tlv_length(len, &mut out)?;
                 out.try_extend(data)?;
             }
         }
@@ -363,12 +368,25 @@ impl Tlv {
     }
 
     /// The length of the V field (0 for NULL/Terminator).
-    pub fn value_length(&self) -> u16 {
+    ///
+    /// Returns [`Type2Error::OutOfRange`] when the value is longer than a TLV
+    /// length field can represent. Reporting a truncated length here previously
+    /// let a 65,536-byte value claim length zero.
+    pub fn value_length(&self) -> Result<u16, Type2Error> {
         match self {
-            Tlv::Null | Tlv::Terminator => 0,
-            Tlv::LockControl(_) | Tlv::MemoryControl(_) => 3,
-            Tlv::NdefMessage(data) | Tlv::Proprietary(data) => data.len() as u16,
+            Tlv::Null | Tlv::Terminator => Ok(0),
+            Tlv::LockControl(_) | Tlv::MemoryControl(_) => Ok(3),
+            Tlv::NdefMessage(data) | Tlv::Proprietary(data) => checked_value_length(data.len()),
         }
+    }
+}
+
+/// Convert a value length to the TLV length field width, rejecting anything
+/// the encoding cannot represent (including the reserved `0xFFFF`).
+fn checked_value_length(len: usize) -> Result<u16, Type2Error> {
+    match u16::try_from(len) {
+        Ok(l) if l <= MAX_TLV_LENGTH => Ok(l),
+        _ => Err(Type2Error::OutOfRange),
     }
 }
 
@@ -477,7 +495,7 @@ mod tests {
 
         let tlvs = parse_tlvs(&data).unwrap();
         assert_eq!(tlvs.len(), 2);
-        assert_eq!(tlvs[0].value_length(), 256);
+        assert_eq!(tlvs[0].value_length(), Ok(256));
         assert_eq!(tlvs[1], Tlv::Terminator);
     }
 
@@ -521,5 +539,59 @@ mod tests {
         let parsed = parse_tlvs(&bytes).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0], tlv);
+    }
+
+    // ── Oversized value serialization (SFT-7597) ───────────────────
+
+    /// Build a `DataVec` of `n` bytes, or `None` if the buffer cannot hold it
+    /// (fixed-capacity default builds cap at 1024).
+    fn value_of(n: usize) -> Option<DataVec> {
+        let mut v = DataVec::new();
+        for _ in 0..n {
+            v.try_push(0xAB).ok()?;
+        }
+        Some(v)
+    }
+
+    /// A value longer than the TLV length field can represent must be rejected
+    /// with a stable error and emit no partial output — never a zero length
+    /// followed by the full payload.
+    #[test]
+    fn serializer_rejects_oversized_values() {
+        // 0xFFFE is the largest representable length; 0xFFFF is reserved and
+        // 0x10000 overflows the field entirely.
+        for len in [0xFFFFusize, 0x10000, 0x20000] {
+            let Some(data) = value_of(len) else {
+                continue; // buffer too small in this build to construct the case
+            };
+            for tlv in [
+                Tlv::NdefMessage(data.clone()),
+                Tlv::Proprietary(data.clone()),
+            ] {
+                assert_eq!(
+                    tlv.value_length(),
+                    Err(Type2Error::OutOfRange),
+                    "len {len} must not report a truncated length"
+                );
+                assert!(
+                    matches!(tlv.to_bytes(), Err(Type2Error::OutOfRange)),
+                    "len {len} must not serialize"
+                );
+            }
+        }
+    }
+
+    /// The exact maximum representable value still serializes correctly, with
+    /// the 3-byte length format and the full payload.
+    #[test]
+    fn serializer_accepts_max_representable_value() {
+        let Some(data) = value_of(MAX_TLV_LENGTH as usize) else {
+            return; // not constructible in fixed-capacity builds
+        };
+        let tlv = Tlv::NdefMessage(data);
+        assert_eq!(tlv.value_length(), Ok(MAX_TLV_LENGTH));
+        let bytes = tlv.to_bytes().unwrap();
+        assert_eq!(&bytes[..4], &[TLV_NDEF_MESSAGE, 0xFF, 0xFF, 0xFE]);
+        assert_eq!(bytes.len(), 4 + MAX_TLV_LENGTH as usize);
     }
 }

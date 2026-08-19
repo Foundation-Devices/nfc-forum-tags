@@ -50,11 +50,23 @@ pub fn parse_tlv_length(data: &[u8], offset: usize) -> Result<(u16, usize), TlvE
     }
 }
 
+/// Largest length encodable in a TLV length field.
+///
+/// `0xFFFF` is reserved by the specification, so the 3-byte format tops out at
+/// `0xFFFE`.
+pub const MAX_TLV_LENGTH: u16 = 0xFFFE;
+
 /// Encode a TLV length field into `out`.
 ///
 /// Uses the 1-byte format for lengths < 255, or the 3-byte format
 /// (0xFF prefix + 2-byte big-endian) for lengths >= 255.
+///
+/// Returns [`TlvError::InvalidTlv`] for the reserved length `0xFFFF`, which the
+/// standard does not permit, without writing any output.
 pub fn encode_tlv_length(len: u16, out: &mut DataVec) -> Result<(), TlvError> {
+    if len > MAX_TLV_LENGTH {
+        return Err(TlvError::InvalidTlv);
+    }
     if len < 0xFF {
         out.try_push(len as u8)?;
     } else {
@@ -154,5 +166,21 @@ mod tests {
         let mut out = DataVec::new();
         encode_tlv_length(255, &mut out).unwrap();
         assert_eq!(&*out, &[0xFF, 0x00, 0xFF]);
+    }
+
+    /// The largest representable length encodes; the reserved 0xFFFF does not,
+    /// and is rejected without emitting any partial output.
+    #[test]
+    fn encode_rejects_reserved_length() {
+        let mut out = DataVec::new();
+        encode_tlv_length(MAX_TLV_LENGTH, &mut out).unwrap();
+        assert_eq!(&*out, &[0xFF, 0xFF, 0xFE]);
+
+        let mut out = DataVec::new();
+        assert_eq!(
+            encode_tlv_length(0xFFFF, &mut out),
+            Err(TlvError::InvalidTlv)
+        );
+        assert!(out.is_empty(), "no partial output on rejection");
     }
 }
