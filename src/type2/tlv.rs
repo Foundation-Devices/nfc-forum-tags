@@ -16,6 +16,7 @@
 //! | FEh | Terminator       | —       | —                    |
 
 use super::Type2Error;
+use super::memory::ADDRESS_SPACE_END;
 use crate::tlv::{self as shared_tlv, MAX_TLV_LENGTH, TlvError};
 use crate::vec::{DataVec, VecExt};
 
@@ -96,13 +97,21 @@ impl LockControlValue {
             return Err(Type2Error::InvalidTlv);
         }
 
-        Ok(LockControlValue {
+        let value = LockControlValue {
             page_addr,
             byte_offset,
             size_in_bits,
             bytes_per_page,
             bytes_locked_per_bit,
-        })
+        };
+
+        // The exponent nibbles are only range-checked for zero above, so a
+        // standards-shaped descriptor can still point outside the tag's
+        // addressable memory (page 15 at a 2^15 page size is byte 491,520,
+        // beyond the last sector). Reject the whole descriptor here rather
+        // than carrying an address that describes no real byte.
+        check_area_in_address_space(value.byte_address(), value.lock_byte_count())?;
+        Ok(value)
     }
 
     /// Serialize to 3 bytes.
@@ -157,12 +166,16 @@ impl MemoryControlValue {
             return Err(Type2Error::InvalidTlv);
         }
 
-        Ok(MemoryControlValue {
+        let value = MemoryControlValue {
             page_addr,
             byte_offset,
             size_in_bytes,
             bytes_per_page,
-        })
+        };
+
+        // Same address-space validation as the Lock Control descriptor.
+        check_area_in_address_space(value.byte_address(), value.size_in_bytes)?;
+        Ok(value)
     }
 
     /// Serialize to 3 bytes.
@@ -178,6 +191,23 @@ impl MemoryControlValue {
             self.bytes_per_page & 0x0F,
         ]
     }
+}
+
+/// Verify that a control descriptor's whole range lies inside the tag's
+/// addressable memory (sectors `0x00`–`0xFE`).
+///
+/// Note this bounds the range against the *address space*, not against the
+/// Capability Container data area: lock and reserved regions legitimately sit
+/// outside the data area — the default dynamic lock area is defined to begin
+/// immediately after it — so bounding them by the CC would reject valid tags.
+fn check_area_in_address_space(start: u32, size: u16) -> Result<(), Type2Error> {
+    let end = start
+        .checked_add(size as u32)
+        .ok_or(Type2Error::InvalidTlv)?;
+    if start >= ADDRESS_SPACE_END || end > ADDRESS_SPACE_END {
+        return Err(Type2Error::InvalidTlv);
+    }
+    Ok(())
 }
 
 /// Parse the TLV length field starting at `data[offset]`.
@@ -539,6 +569,63 @@ mod tests {
         let parsed = parse_tlvs(&bytes).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0], tlv);
+    }
+
+    // ── Control-TLV address-space validation (SFT-7603) ────────────
+
+    /// The audit's demonstrated Lock Control TLV describes byte 491,520
+    /// (page 15 at a 2^15 page size), well past the last addressable sector.
+    /// It must be rejected as InvalidTlv, identically in every build profile.
+    #[test]
+    fn demonstrated_lock_control_tlv_is_rejected() {
+        assert_eq!(
+            LockControlValue::from_bytes([0xF0, 0x08, 0x1F]),
+            Err(Type2Error::InvalidTlv)
+        );
+        // And through the full TLV stream, as a tag would present it.
+        let data = [0x01, 0x03, 0xF0, 0x08, 0x1F, 0xFE];
+        assert_eq!(parse_tlvs(&data), Err(Type2Error::InvalidTlv));
+    }
+
+    /// Descriptors whose range fits the address space are still accepted, so
+    /// the validation does not reject legitimate tags.
+    #[test]
+    fn in_range_control_tlvs_still_accepted() {
+        // 7 * 2^15 = 229,376 — large but inside the addressable space.
+        let lc = LockControlValue::from_bytes([0x70, 0x08, 0x3F]).unwrap();
+        assert_eq!(lc.byte_address(), 229_376);
+        // A typical small descriptor.
+        let lc = LockControlValue::from_bytes([0xE0, 0x06, 0x33]).unwrap();
+        assert_eq!(lc.byte_address(), 112);
+        let mc = MemoryControlValue::from_bytes([0xE1, 0x0F, 0x03]).unwrap();
+        assert_eq!(mc.byte_address(), 113);
+    }
+
+    /// Every combination of both exponent nibbles, across page addresses and
+    /// byte offsets, must parse or fail cleanly — never panic, and never yield
+    /// a descriptor reaching outside the address space.
+    #[test]
+    fn all_exponent_combinations_are_safe() {
+        for page_addr in 0u8..16 {
+            for byte_offset in 0u8..16 {
+                let b0 = (page_addr << 4) | byte_offset;
+                for size in [0x00u8, 0x01, 0x08, 0x80, 0xFF] {
+                    for bytes_per_page in 0u8..16 {
+                        for locked_per_bit in 0u8..16 {
+                            let b2 = (locked_per_bit << 4) | bytes_per_page;
+                            if let Ok(lc) = LockControlValue::from_bytes([b0, size, b2]) {
+                                let end = lc.byte_address() + lc.lock_byte_count() as u32;
+                                assert!(end <= ADDRESS_SPACE_END, "lock area escapes space");
+                            }
+                            if let Ok(mc) = MemoryControlValue::from_bytes([b0, size, b2]) {
+                                let end = mc.byte_address() + mc.size_in_bytes as u32;
+                                assert!(end <= ADDRESS_SPACE_END, "reserved area escapes space");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ── Oversized value serialization (SFT-7597) ───────────────────
