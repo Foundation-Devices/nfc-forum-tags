@@ -21,6 +21,15 @@ pub const BLOCKS_PER_SECTOR: usize = 256;
 /// Sector size in bytes (256 blocks * 4 bytes).
 pub const SECTOR_SIZE: usize = BLOCK_SIZE * BLOCKS_PER_SECTOR;
 
+/// Highest addressable sector number.
+///
+/// Sector `0xFF` is reserved by the Type 2 Tag protocol and must never be
+/// selected or produced by an address conversion.
+pub const MAX_SECTOR: u8 = 0xFE;
+
+/// One past the last addressable byte (end of sector [`MAX_SECTOR`]).
+pub const ADDRESS_SPACE_END: u32 = (MAX_SECTOR as u32 + 1) * SECTOR_SIZE as u32;
+
 /// Block number of the Capability Container.
 pub const CC_BLOCK: u8 = 3;
 
@@ -42,7 +51,10 @@ pub const STATIC_LOCK_BYTE_ADDR: u16 = 10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LockArea {
     /// Byte address of the first lock byte.
-    pub byte_address: u16,
+    ///
+    /// A `u32`: standards-valid control TLVs can describe addresses above
+    /// `u16::MAX`, which must be represented faithfully rather than wrapped.
+    pub byte_address: u32,
     /// Number of lock bits in this area.
     pub size_in_bits: u16,
     /// Number of data bytes each lock bit protects.
@@ -56,8 +68,12 @@ impl LockArea {
     }
 
     /// Byte address past the last lock byte.
-    pub fn end_address(&self) -> u16 {
-        self.byte_address + self.lock_byte_count()
+    ///
+    /// Saturating: an area whose end exceeds the `u32` space is clamped rather
+    /// than wrapped, so it can never alias a low address.
+    pub fn end_address(&self) -> u32 {
+        self.byte_address
+            .saturating_add(self.lock_byte_count() as u32)
     }
 
     /// Create from a parsed Lock Control TLV value.
@@ -70,7 +86,7 @@ impl LockArea {
     }
 
     /// Check if a byte address falls within this lock area.
-    pub fn contains(&self, addr: u16) -> bool {
+    pub fn contains(&self, addr: u32) -> bool {
         addr >= self.byte_address && addr < self.end_address()
     }
 }
@@ -79,15 +95,19 @@ impl LockArea {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReservedArea {
     /// Byte address of the first reserved byte.
-    pub byte_address: u16,
+    ///
+    /// A `u32` for the same reason as [`LockArea::byte_address`].
+    pub byte_address: u32,
     /// Number of reserved bytes.
     pub size: u16,
 }
 
 impl ReservedArea {
     /// Byte address past the last reserved byte.
-    pub fn end_address(&self) -> u16 {
-        self.byte_address + self.size
+    ///
+    /// Saturating, so an out-of-space end can never wrap to a low address.
+    pub fn end_address(&self) -> u32 {
+        self.byte_address.saturating_add(self.size as u32)
     }
 
     /// Create from a parsed Memory Control TLV value.
@@ -99,7 +119,7 @@ impl ReservedArea {
     }
 
     /// Check if a byte address falls within this reserved area.
-    pub fn contains(&self, addr: u16) -> bool {
+    pub fn contains(&self, addr: u32) -> bool {
         addr >= self.byte_address && addr < self.end_address()
     }
 }
@@ -166,7 +186,7 @@ impl MemoryLayout {
     }
 
     /// Check if a byte address is in a lock or reserved area (should be skipped during data reads).
-    pub fn is_skip_area(&self, byte_addr: u16) -> bool {
+    pub fn is_skip_area(&self, byte_addr: u32) -> bool {
         self.lock_areas.iter().any(|a| a.contains(byte_addr))
             || self.reserved_areas.iter().any(|a| a.contains(byte_addr))
     }
@@ -190,17 +210,30 @@ impl MemoryLayout {
     }
 
     /// Convert a linear byte address to (sector, block, offset).
-    pub fn address_to_sector_block(byte_addr: u16) -> (u8, u8, u8) {
-        let sector = (byte_addr / SECTOR_SIZE as u16) as u8;
-        let within_sector = byte_addr % SECTOR_SIZE as u16;
-        let block = (within_sector / BLOCK_SIZE as u16) as u8;
-        let offset = (within_sector % BLOCK_SIZE as u16) as u8;
-        (sector, block, offset)
+    ///
+    /// Returns `None` if the address lies beyond the last addressable sector
+    /// ([`MAX_SECTOR`]); sector `0xFF` is reserved by the protocol and is never
+    /// produced. Computing in `u32` keeps the full protocol address space
+    /// (sectors 0x00–0xFE) representable.
+    pub fn address_to_sector_block(byte_addr: u32) -> Option<(u8, u8, u8)> {
+        let sector = byte_addr / SECTOR_SIZE as u32;
+        if sector > MAX_SECTOR as u32 {
+            return None;
+        }
+        let within_sector = byte_addr % SECTOR_SIZE as u32;
+        let block = (within_sector / BLOCK_SIZE as u32) as u8;
+        let offset = (within_sector % BLOCK_SIZE as u32) as u8;
+        Some((sector as u8, block, offset))
     }
 
     /// Convert (sector, block, offset) to a linear byte address.
-    pub fn sector_block_to_address(sector: u8, block: u8, offset: u8) -> u16 {
-        sector as u16 * SECTOR_SIZE as u16 + block as u16 * BLOCK_SIZE as u16 + offset as u16
+    ///
+    /// Returns `None` for the reserved sector `0xFF`.
+    pub fn sector_block_to_address(sector: u8, block: u8, offset: u8) -> Option<u32> {
+        if sector > MAX_SECTOR {
+            return None;
+        }
+        Some(sector as u32 * SECTOR_SIZE as u32 + block as u32 * BLOCK_SIZE as u32 + offset as u32)
     }
 
     /// Physical byte address of the `n`-th usable byte of the data area,
@@ -213,12 +246,16 @@ impl MemoryLayout {
     /// addresses, so the writer can locate the NDEF TLV and step over
     /// lock/reserved bytes instead of overwriting them.
     ///
-    /// Returns `None` if the walk runs past addressable (`u16`) memory, which
-    /// can only happen for a malformed layout whose skip regions never end.
-    pub fn usable_offset_to_address(&self, n: u16) -> Option<u16> {
-        let mut addr = DATA_START_BLOCK as u16 * BLOCK_SIZE as u16;
+    /// Returns `None` if the walk runs past the addressable protocol space,
+    /// which can only happen for a malformed layout whose skip regions never
+    /// end.
+    pub fn usable_offset_to_address(&self, n: u16) -> Option<u32> {
+        let mut addr = DATA_START_BLOCK as u32 * BLOCK_SIZE as u32;
         let mut remaining = n;
         loop {
+            if addr >= ADDRESS_SPACE_END {
+                return None;
+            }
             if !self.is_skip_area(addr) {
                 if remaining == 0 {
                     return Some(addr);
@@ -235,7 +272,7 @@ fn default_dynamic_lock_area(data_area_size: u16) -> LockArea {
     let extra_bytes = data_area_size.saturating_sub(STATIC_DATA_AREA_SIZE as u16);
     let lock_bits = extra_bytes.div_ceil(8);
     // Default position: first byte after the data area.
-    let byte_address = DATA_START_BLOCK as u16 * BLOCK_SIZE as u16 + data_area_size;
+    let byte_address = DATA_START_BLOCK as u32 * BLOCK_SIZE as u32 + data_area_size as u32;
 
     LockArea {
         byte_address,
@@ -306,15 +343,84 @@ mod tests {
 
     #[test]
     fn address_conversion_roundtrip() {
-        let addr = 113u16;
-        let (sector, block, offset) = MemoryLayout::address_to_sector_block(addr);
+        let addr = 113u32;
+        let (sector, block, offset) = MemoryLayout::address_to_sector_block(addr).unwrap();
         assert_eq!(sector, 0);
         assert_eq!(block, 28);
         assert_eq!(offset, 1);
         assert_eq!(
             MemoryLayout::sector_block_to_address(sector, block, offset),
-            addr
+            Some(addr)
         );
+    }
+
+    #[test]
+    fn address_conversion_spans_full_sector_range() {
+        // Addresses through the last valid sector (0xFE) round-trip.
+        let last = MemoryLayout::sector_block_to_address(MAX_SECTOR, 255, 3).unwrap();
+        assert_eq!(last, ADDRESS_SPACE_END - 1);
+        let (sector, block, offset) = MemoryLayout::address_to_sector_block(last).unwrap();
+        assert_eq!((sector, block, offset), (MAX_SECTOR, 255, 3));
+
+        // Reserved sector 0xFF is rejected in both directions.
+        assert_eq!(MemoryLayout::sector_block_to_address(0xFF, 0, 0), None);
+        assert_eq!(
+            MemoryLayout::address_to_sector_block(ADDRESS_SPACE_END),
+            None
+        );
+    }
+
+    /// A standards-valid control TLV can encode an address above `u16::MAX`.
+    /// It must be represented faithfully, never panicking or wrapping.
+    #[test]
+    fn oversized_control_address_does_not_wrap() {
+        // PageAddr 7, BytesPerPage 15 → 7 * 2^15 = 229,376.
+        let lc = LockControlValue {
+            page_addr: 7,
+            byte_offset: 0,
+            size_in_bits: 8,
+            bytes_per_page: 15,
+            bytes_locked_per_bit: 3,
+        };
+        assert_eq!(lc.byte_address(), 229_376);
+        let area = LockArea::from_lock_control(&lc);
+        assert_eq!(area.byte_address, 229_376);
+        // Far above the addressable space, so it shadows no real data byte.
+        assert!(!area.contains(32_768));
+        assert!(area.contains(229_376));
+
+        let mc = MemoryControlValue {
+            page_addr: 7,
+            byte_offset: 0,
+            size_in_bytes: 8,
+            bytes_per_page: 15,
+        };
+        assert_eq!(mc.byte_address(), 229_376);
+    }
+
+    /// Every encodable three-byte Lock/Memory Control value must be processed
+    /// without panicking, in debug (overflow-checked) builds included.
+    #[test]
+    fn all_control_values_process_without_panic() {
+        let cc = CapabilityContainer::try_from([0xE1, 0x10, 0x0C, 0x00]).unwrap();
+        for b0 in 0u8..=255 {
+            for b1 in 0u8..=255 {
+                for b2 in 0u8..=255 {
+                    if let Ok(lc) = LockControlValue::from_bytes([b0, b1, b2]) {
+                        let area = LockArea::from_lock_control(&lc);
+                        let _ = area.end_address();
+                        let _ = area.contains(16);
+                        let _ = MemoryLayout::from_cc_and_tlvs(&cc, &[Tlv::LockControl(lc)]);
+                    }
+                    if let Ok(mc) = MemoryControlValue::from_bytes([b0, b1, b2]) {
+                        let area = ReservedArea::from_memory_control(&mc);
+                        let _ = area.end_address();
+                        let _ = area.contains(16);
+                        let _ = MemoryLayout::from_cc_and_tlvs(&cc, &[Tlv::MemoryControl(mc)]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

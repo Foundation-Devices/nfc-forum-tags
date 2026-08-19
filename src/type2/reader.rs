@@ -7,7 +7,7 @@
 //! reading, and writing on a Type 2 Tag after ISO 14443-3A activation.
 
 use super::cc::CapabilityContainer;
-use super::memory::{BLOCK_SIZE, CC_BLOCK, DATA_START_BLOCK, MemoryLayout};
+use super::memory::{BLOCK_SIZE, CC_BLOCK, DATA_START_BLOCK, MAX_SECTOR, MemoryLayout};
 use super::tlv::{self, Tlv};
 use super::{Answer, Command, T2TTransceiver, Type2Error};
 use crate::tag::AccessCondition;
@@ -154,6 +154,10 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
     /// Packet 1 retries on transceiver errors; Packet 2 does not retry
     /// since passive ACK (silence) makes retry semantics ambiguous.
     pub fn sector_select(&mut self, sector: u8) -> Result<(), ReaderError<T::Error>> {
+        // Sector 0xFF is reserved by the protocol and must never be selected.
+        if sector > MAX_SECTOR {
+            return Err(Type2Error::OutOfRange.into());
+        }
         if sector == self.current_sector {
             return Ok(());
         }
@@ -210,7 +214,7 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
         let mut tlv_scan = TlvScanner::new();
 
         // Start reading from block 4.
-        let start_byte_addr = DATA_START_BLOCK as u16 * BLOCK_SIZE as u16;
+        let start_byte_addr = DATA_START_BLOCK as u32 * BLOCK_SIZE as u32;
         let mut byte_addr = start_byte_addr;
 
         // Read block by block (4 bytes at a time) to handle skip areas.
@@ -218,7 +222,8 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
         // when blocks fall within the same 16-byte READ response.
 
         'outer: while bytes_read < total_bytes {
-            let (sector, block, _) = MemoryLayout::address_to_sector_block(byte_addr);
+            let (sector, block, _) =
+                MemoryLayout::address_to_sector_block(byte_addr).ok_or(Type2Error::OutOfRange)?;
 
             // Switch sector if needed.
             if sector != self.current_sector {
@@ -251,7 +256,7 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
 
             // Process each byte in this block.
             for (i, &byte) in block_data.iter().enumerate().take(BLOCK_SIZE) {
-                let addr = byte_addr + i as u16;
+                let addr = byte_addr + i as u32;
                 if layout.is_skip_area(addr) {
                     continue;
                 }
@@ -267,7 +272,7 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
                 }
             }
 
-            byte_addr += BLOCK_SIZE as u16;
+            byte_addr += BLOCK_SIZE as u32;
         }
 
         Ok(result)
@@ -493,9 +498,9 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
     fn write_usable_bytes(
         &mut self,
         layout: &MemoryLayout,
-        start_addr: u16,
+        start_addr: u32,
         data: &[u8],
-        limit_addr: u16,
+        limit_addr: u32,
     ) -> Result<(), ReaderError<T::Error>> {
         let mut di = 0usize;
         let mut addr = start_addr;
@@ -504,24 +509,25 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
             if addr >= limit_addr {
                 return Err(Type2Error::OutOfRange.into());
             }
-            let (sector, block, offset) = MemoryLayout::address_to_sector_block(addr);
+            let (sector, block, offset) =
+                MemoryLayout::address_to_sector_block(addr).ok_or(Type2Error::OutOfRange)?;
             if sector != self.current_sector {
                 self.sector_select(sector)?;
             }
-            let page_base = addr - offset as u16;
+            let page_base = addr - offset as u32;
 
             // Fast path: a fully usable page that remaining data fully covers
             // needs no read-modify-write.
             let page_all_usable =
-                (0..BLOCK_SIZE).all(|i| !layout.is_skip_area(page_base + i as u16));
+                (0..BLOCK_SIZE).all(|i| !layout.is_skip_area(page_base + i as u32));
             if offset == 0 && data.len() - di >= BLOCK_SIZE && page_all_usable {
-                if page_base as usize + BLOCK_SIZE > limit_addr as usize {
+                if page_base + BLOCK_SIZE as u32 > limit_addr {
                     return Err(Type2Error::OutOfRange.into());
                 }
                 let page = [data[di], data[di + 1], data[di + 2], data[di + 3]];
                 self.write(block, page)?;
                 di += BLOCK_SIZE;
-                addr = page_base + BLOCK_SIZE as u16;
+                addr = page_base + BLOCK_SIZE as u32;
                 continue;
             }
 
@@ -534,7 +540,7 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
                 if di >= data.len() {
                     break;
                 }
-                let a = page_base + i as u16;
+                let a = page_base + i as u32;
                 if a >= limit_addr {
                     return Err(Type2Error::OutOfRange.into());
                 }
@@ -548,7 +554,7 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> T2TReader<'t, T, N> {
             if touched {
                 self.write(block, page)?;
             }
-            addr = page_base + BLOCK_SIZE as u16;
+            addr = page_base + BLOCK_SIZE as u32;
         }
         Ok(())
     }

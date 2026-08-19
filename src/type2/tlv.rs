@@ -63,9 +63,15 @@ pub struct LockControlValue {
 
 impl LockControlValue {
     /// Byte address of the lock area start in the tag's linear address space.
-    pub fn byte_address(&self) -> u16 {
-        let page_size = 1u16 << self.bytes_per_page;
-        self.page_addr as u16 * page_size + self.byte_offset as u16
+    ///
+    /// Computed in `u32`: `bytes_per_page` may encode a page size up to
+    /// `2^15`, so a standards-valid control TLV can describe an address far
+    /// above `u16::MAX` (e.g. `PageAddr = 7`, `BytesPerPage = 15` is byte
+    /// 229,376). Narrower arithmetic panicked in overflow-checked builds and
+    /// silently wrapped otherwise.
+    pub fn byte_address(&self) -> u32 {
+        let page_size = 1u32 << self.bytes_per_page;
+        self.page_addr as u32 * page_size + self.byte_offset as u32
     }
 
     /// Number of lock bytes (ceiling of size_in_bits / 8).
@@ -131,9 +137,13 @@ pub struct MemoryControlValue {
 
 impl MemoryControlValue {
     /// Byte address of the reserved area start.
-    pub fn byte_address(&self) -> u16 {
-        let page_size = 1u16 << self.bytes_per_page;
-        self.page_addr as u16 * page_size + self.byte_offset as u16
+    ///
+    /// Computed in `u32` for the same reason as
+    /// [`LockControlValue::byte_address`]: a standards-valid page exponent can
+    /// describe an address above `u16::MAX`.
+    pub fn byte_address(&self) -> u32 {
+        let page_size = 1u32 << self.bytes_per_page;
+        self.page_addr as u32 * page_size + self.byte_offset as u32
     }
 
     /// Parse from 3 raw bytes.
