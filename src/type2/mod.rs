@@ -60,6 +60,11 @@ pub enum Type2Error {
     /// reactivate the tag and read back the affected page before issuing
     /// another state-changing command.
     AmbiguousOutcome,
+    /// A requested configuration is not valid for this tag — for example a
+    /// protection boundary the chip would interpret as disabling protection.
+    ///
+    /// Returned before any state-changing command is issued.
+    InvalidConfiguration,
     /// Unknown command code when parsing.
     UnknownCommand(u8),
 }
